@@ -197,20 +197,49 @@ async function doPairing() {
     }
 }
 
-// /test شماره پیام - تست ارسال به یه شماره
-tg.onText(/\/test (\d+)\s+(.+)/, async (m, match) => {
+// ============ /test دو مرحله‌ای ============
+let testState = {}; // { chatId: { step: 'number'|'message', number: '' } }
+
+// /test → مرحله ۱: بگیر شماره
+tg.onText(/\/test/, (m) => {
     if (!isAdmin(m.from.id)) return;
-    if (!waReady || !sock) return tg.sendMessage(m.from.id, '⚠️ واتساپ وصل نیست!');
-    const num = match[1];
-    const msg = match[2];
-    const jid = num + '@s.whatsapp.net';
-    try {
-        const [r] = await sock.onWhatsApp(jid);
-        if (!r.exists) return tg.sendMessage(m.from.id, `❌ شماره ${num} واتساپ نداره`);
-        await sock.sendMessage(jid, { text: msg });
-        tg.sendMessage(m.from.id, `✅ پیام فرستاده شد به ${num}\n📝 ${msg}`);
-    } catch (e) {
-        tg.sendMessage(m.from.id, `❌ خطا: ${e.message}`);
+    testState[m.from.id] = { step: 'number' };
+    tg.sendMessage(m.from.id, '📞 شماره واتساپ رو بفرست:\n(مثال: 989123456789)');
+});
+
+// هندل پیام‌های عادی برای /test flow
+tg.on('message', (m) => {
+    if (!isAdmin(m.from.id)) return;
+    const st = testState[m.from.id];
+    if (!st) return; // حالت عادی
+    const text = m.text;
+    if (!text || text.startsWith('/')) return;
+
+    if (st.step === 'number') {
+        const num = text.replace(/[^0-9]/g, '');
+        if (num.length < 8) return tg.sendMessage(m.from.id, '❌ شماره نامعتبر. دوباره بفرست.');
+        st.number = num;
+        st.step = 'message';
+        tg.sendMessage(m.from.id, `📞 شماره: ${num}\n\n📝 پیامی که میخوای بفرستی رو بنویس:`);
+        return;
+    }
+
+    if (st.step === 'message') {
+        const num = st.number;
+        const msg = text;
+        delete testState[m.from.id];
+
+        if (!waReady || !sock) return tg.sendMessage(m.from.id, '⚠️ واتساپ وصل نیست!');
+
+        const jid = num + '@s.whatsapp.net';
+        sock.onWhatsApp(jid).then(([r]) => {
+            if (!r.exists) return tg.sendMessage(m.from.id, `❌ شماره ${num} واتساپ نداره`);
+            return sock.sendMessage(jid, { text: msg });
+        }).then(() => {
+            tg.sendMessage(m.from.id, `✅ پیام فرستاده شد!\n📞 ${num}\n📝 ${msg}`);
+        }).catch(e => {
+            tg.sendMessage(m.from.id, `❌ خطا: ${e.message}`);
+        });
     }
 });
 
