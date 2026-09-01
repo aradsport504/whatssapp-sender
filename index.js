@@ -39,8 +39,14 @@ function sendToAdmin(text, options = {}) {
 
 // ============ WHATSAPP ============
 let sock;
+let reconnecting = false;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
 
 async function connectWhatsApp() {
+    if (reconnecting) return;
+    reconnecting = true;
+
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
     sock = makeWASocket({
@@ -51,6 +57,8 @@ async function connectWhatsApp() {
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
         browser: ['WhatsApp Sender', 'Chrome', '1.0.0'],
+        connectTimeout: 60000,
+        keepAliveIntervalMs: 30000,
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -59,23 +67,49 @@ async function connectWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            // Send QR to admin via Telegram
+            reconnecting = false;
+            reconnectAttempts = 0;
             const qrImage = await QRCode.toBuffer(qr, { type: 'png', width: 400 });
             ADMIN_IDS.forEach(id => {
                 tgBot.sendPhoto(id, qrImage, {
-                    caption: '📱 QR Code واتساپ\n\nگوشیت رو باز کن و این کد رو اسکن کن:\nSettings → Linked Devices → Link a Device'
+                    caption: '📱 QR Code واتساپ\n\nگوشیت رو باز کن و این کد رو اسکن کن:\nSettings → Linked Devices → Link a Device\n\n⏳ تا اسکن صبر کن، بعد از اتصال پیام میدم.'
                 }).catch(() => {});
             });
         }
 
         if (connection === 'close') {
+            whatsappReady = false;
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            if (statusCode !== DisconnectReason.loggedOut) {
-                sendToAdmin('⚠️ واتساپ قطع شد! در حال اتصال مجدد...');
-                setTimeout(connectWhatsApp, 5000);
+            const errorReason = lastDisconnect?.error?.output?.payload?.error;
+
+            console.log(`Connection closed. Status: ${statusCode}, Reason: ${errorReason}`);
+
+            if (statusCode === DisconnectReason.loggedOut) {
+                reconnecting = false;
+                sendToAdmin('❌ واتساپ از اکانت خارج شد! دوباره اسکن کن.\n/settings رو بزن تا QR جدید بیاد.');
+                if (fs.existsSync(AUTH_DIR)) {
+                    fs.rmSync(AUTH_DIR, { recursive: true });
+                }
+            } else if (statusCode === DisconnectReason.connectionClosed ||
+                       statusCode === DisconnectReason.connectionLost ||
+                       statusCode === DisconnectReason.connectionReplaced ||
+                       statusCode === DisconnectReason.timedOut) {
+                reconnectAttempts++;
+                if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+                    const delay = Math.min(reconnectAttempts * 5000, 30000);
+                    console.log(`Reconnecting in ${delay/1000}s (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+                    setTimeout(() => {
+                        reconnecting = false;
+                        connectWhatsApp();
+                    }, delay);
+                } else {
+                    reconnecting = false;
+                    reconnectAttempts = 0;
+                    sendToAdmin('⚠️ واتساپ قطع شد و پس از ۵ بار تلاش وصل نشد.\n/settings رو بزن تا QR جدید بیاد.');
+                }
             } else {
-                whatsappReady = false;
-                sendToAdmin('❌ واتساپ از اکانت خارج شد! دوباره وصل شو.');
+                reconnecting = false;
+                sendToAdmin(`⚠️ واتساپ قطع شد (کد: ${statusCode}). لطفاً دوباره اسکن کن.`);
                 if (fs.existsSync(AUTH_DIR)) {
                     fs.rmSync(AUTH_DIR, { recursive: true });
                 }
@@ -84,7 +118,9 @@ async function connectWhatsApp() {
 
         if (connection === 'open') {
             whatsappReady = true;
-            sendToAdmin('✅ واتساپ با موفقیت وصل شد!');
+            reconnecting = false;
+            reconnectAttempts = 0;
+            sendToAdmin('✅ واتساپ با موفقیت وصل شد! 🎉');
         }
     });
 }
