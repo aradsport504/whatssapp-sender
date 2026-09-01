@@ -14,12 +14,9 @@ const DELAY_MIN = 3 * 60 * 1000;
 const DELAY_MAX = 5 * 60 * 1000;
 const AUTH_DIR = './auth_info';
 
-// ============ HEALTH CHECK (keep Railway alive) ============
+// ============ HEALTH CHECK ============
 const PORT = process.env.PORT || 3000;
-http.createServer((_, res) => {
-    res.writeHead(200);
-    res.end('OK');
-}).listen(PORT, () => console.log(`🌐 Health check on :${PORT}`));
+http.createServer((_, res) => { res.writeHead(200); res.end('OK'); }).listen(PORT, () => console.log(`🌐 Health on :${PORT}`));
 
 // ============ STATE ============
 let waReady = false;
@@ -28,8 +25,8 @@ let sentNums = new Set();
 let sending = false;
 let sentToday = 0;
 let lastDay = '';
-let sock = null;   // single global socket reference
-let qrSent = false; // flag to avoid sending old QR
+let sock = null;
+let reconnectTimer = null;
 
 const tg = new TelegramBot(TG_TOKEN, { polling: true });
 const ok = (id) => ADMINS.includes(id);
@@ -37,23 +34,22 @@ const tell = (t) => ADMINS.forEach(id => tg.sendMessage(id, t).catch(() => {}));
 
 // ============ QR → Telegram ============
 async function sendQR(data) {
-    qrSent = true;
     try {
         const buf = await QR.toBuffer(data, { type: 'png', width: 400, margin: 2 });
         for (const id of ADMINS) {
             await tg.sendPhoto(id, buf, {
-                caption: '📱 اسکن کن:\nSettings → Linked Devices → Link a Device\n\n⏳ هر ۳۰ ثانیه رفرش میشه'
+                caption: '📱 اسکن کن:\nSettings → Linked Devices → Link a Device'
             }).catch(e => console.log('photo err:', e.message));
         }
     } catch (e) {
         console.error('QR err:', e.message);
-        tell('❌ خطا در ساخت QR: ' + e.message);
+        tell('❌ خطا QR: ' + e.message);
     }
 }
 
 // ============ CONNECT WHATSAPP ============
 function connectWA() {
-    console.log('🔄 Starting WA connection...');
+    console.log('🔄 Starting WA...');
     
     useMultiFileAuthState(AUTH_DIR).then(({ state, saveCreds }) => {
         const s = makeWASocket({
@@ -68,78 +64,85 @@ function connectWA() {
         });
 
         sock = s;
-        qrSent = false;
 
         s.ev.on('creds.update', saveCreds);
 
         s.ev.on('connection.update', (u) => {
             const { connection, lastDisconnect, qr } = u;
 
-            // QR received
             if (qr) {
-                console.log('📱 QR CODE ARRIVED');
+                console.log('📱 QR CODE!');
                 sendQR(qr);
             }
 
-            // Connected
             if (connection === 'open') {
                 waReady = true;
-                console.log('✅ WhatsApp CONNECTED');
+                console.log('✅ WA CONNECTED');
                 tell('✅ واتساپ وصل شد!');
             }
 
-            // Disconnected
             if (connection === 'close') {
                 waReady = false;
                 const code = lastDisconnect?.error?.output?.statusCode;
-                console.log('❌ Disconnected, code:', code);
+                console.log('❌ Closed code:', code);
 
-                if (code === DisconnectReason.loggedOut) {
-                    console.log('Logged out, cleaning auth...');
-                    try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {}
-                    tell('❌ واتساپ خارج شد.\n/settings بزن.');
-                } else if (code === DisconnectReason.connectionReplaced) {
-                    tell('⚠️ واتساپ جای دیگه وصل شد.');
-                } else {
-                    // Auto reconnect for other errors
-                    console.log('🔄 Reconnecting in 5s...');
-                    setTimeout(connectWA, 5000);
+                // Handle specific codes
+                switch (code) {
+                    case 401: // loggedOut
+                        console.log('Logged out');
+                        try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {}
+                        tell('❌ واتساپ خارج شد.\n/start بزن.');
+                        break;
+
+                    case 440: // connectionReplaced
+                    case 405: // older code for replaced
+                        console.log('Connection replaced - another session active');
+                        // Don't auto-reconnect, just tell user
+                        tell('⚠️ اتصال جایگزین شد!\n\n📞 از گوشیت:\n1. واتساپ → Settings → Linked Devices\n2. همه دستگاه‌ها رو Log Out کن\n3. بعد /settings بزن');
+                        break;
+
+                    case 408: // timedOut / connectionLost
+                    case 428: // connectionClosed
+                    case 515: // restartRequired
+                        console.log('Reconnecting in 5s...');
+                        reconnectTimer = setTimeout(connectWA, 5000);
+                        break;
+
+                    default:
+                        console.log('Unknown code, cleaning auth and retrying...');
+                        try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {}
+                        reconnectTimer = setTimeout(connectWA, 10000);
+                        break;
                 }
             }
         });
-
-        s.ev.on('error', (err) => {
-            console.error('Sock error:', err.message);
-        });
-
     }).catch(err => {
-        console.error('❌ Auth error:', err.message);
-        // Try to clean and retry
+        console.error('❌ Auth err:', err.message);
         try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {}
-        setTimeout(connectWA, 5000);
+        reconnectTimer = setTimeout(connectWA, 5000);
     });
 }
 
-// ============ RESTART WA (without killing process) ============
+// ============ RESTART WA ============
 function restartWA() {
     console.log('⚙️ Restarting WA...');
-    tell('🔄 در حال ریستارت واتساپ...');
-    
+    tell('🔄 ریستارت واتساپ...');
+
+    // Clear any pending reconnect
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+
     // Destroy old socket
     if (sock) {
         try { sock.end(undefined); } catch(e) {}
         sock = null;
     }
     waReady = false;
-    qrSent = false;
 
     // Clean auth
     try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {}
 
-    // Reconnect after short delay
-    setTimeout(() => {
-        connectWA();
-    }, 2000);
+    // Reconnect
+    setTimeout(connectWA, 2000);
 }
 
 // ============ MESSAGING ============
@@ -180,25 +183,24 @@ async function startSend(tpl) {
     tell(`✅ تمام! ✅${s} ❌${f}`);
 }
 
-// ============ TELEGRAM COMMANDS ============
+// ============ COMMANDS ============
 tg.onText(/\/start/, (m) => {
     if (!ok(m.from.id)) return;
     tg.sendMessage(m.from.id,
         '🤖 ربات واتساپ\n\n' +
         '/settings - ریستارت + QR جدید\n' +
         '/status - وضعیت\n' +
-        '/send متن - ارسال ({name} در متن)\n' +
+        '/send متن - ارسال ({name})\n' +
         '/stop - توقف\n' +
         '/contacts - شماره‌ها\n' +
         '/limit - لیمیت\n' +
-        '/addaccess [ID] - دسترسی\n' +
-        '/accesslist - لیست دسترسی\n\n' +
+        '/addaccess [ID]\n' +
+        '/accesslist\n\n' +
         '📎 فایل اکسل بفرست');
 });
 
 tg.onText(/\/settings/, (m) => {
     if (!ok(m.from.id)) return;
-    console.log('⚙️ /settings from', m.from.id);
     restartWA();
 });
 
@@ -228,7 +230,7 @@ tg.onText(/\/send (.+)/, (m, match) => {
 
 tg.onText(/\/contacts/, (m) => {
     if (!ok(m.from.id)) return;
-    if (!contacts.length) return tg.sendMessage(m.from.id, 'خالیه. فایل اکسل بفرست.');
+    if (!contacts.length) return tg.sendMessage(m.from.id, 'خالیه.');
     let l = contacts.slice(0, 20).map((c, i) => `${i+1}. ${c.number} - ${c.name || '-'}`).join('\n');
     if (contacts.length > 20) l += `\n... +${contacts.length - 20}`;
     tg.sendMessage(m.from.id, `📋 (${contacts.length}):\n${l}`);
@@ -237,7 +239,7 @@ tg.onText(/\/contacts/, (m) => {
 tg.onText(/\/limit/, (m) => {
     if (!ok(m.from.id)) return;
     resetDay();
-    tg.sendMessage(m.from.id, `📊 امروز: ${sentToday}/${MAX_MSGS}\n⏰ ۳-۵ دقیقه فاصله\n🕐 ۸:۰۰-۲۲:۰۰`);
+    tg.sendMessage(m.from.id, `📊 امروز: ${sentToday}/${MAX_MSGS}\n⏰ ۳-۵ دقیقه\n🕐 ۸:۰۰-۲۲:۰۰`);
 });
 
 tg.onText(/\/addaccess (.+)/, (m, match) => {
@@ -274,10 +276,10 @@ tg.on('document', async (m) => {
 });
 
 // ============ START ============
-console.log('🚀 Bot starting...');
+console.log('🚀 Starting...');
 if (fs.existsSync('./contacts.json')) {
     contacts = JSON.parse(fs.readFileSync('./contacts.json', 'utf8'));
-    console.log(`📋 ${contacts.length} contacts loaded`);
+    console.log(`📋 ${contacts.length} contacts`);
 }
 connectWA();
-tell('🤖 ربات آماده!\n/settings بزن تا QR بیاد → اسکن کن');
+tell('🤖 ربات آماده!\n/settings بزن تا QR بیاد');
