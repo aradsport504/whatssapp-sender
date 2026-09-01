@@ -1,16 +1,14 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore, fetchLatestBaileysVersion, makeCacheableSignalKeyStore: _ } = require('@whiskeysockets/baileys');
 const TelegramBot = require('node-telegram-bot-api');
 const XLSX = require('xlsx');
 const fs = require('fs');
 const http = require('http');
 const pino = require('pino');
-const QR = require('qrcode');
-const { ProxyAgent } = require('proxy-agent');
 
 // ============ CONFIG ============
 const TG_TOKEN = process.env.TELEGRAM_TOKEN || '8902204232:AAEw0N7UR1amMKO9xuGV8KkHyS-kym7sCmk';
 const ADMINS = (process.env.ADMIN_IDS || '6138410965').split(',').map(Number);
-const PROXY_URL = process.env.PROXY_URL || ''; // socks5://user:pass@host:port  or  http://user:pass@host:port
+const MY_NUMBER = process.env.MY_NUMBER || '989128288713'; // شماره خودت بدون + و صفر اول
 const MAX_MSGS = 35;
 const DELAY_MIN = 3 * 60 * 1000;
 const DELAY_MAX = 5 * 60 * 1000;
@@ -29,123 +27,123 @@ let lastDay = '';
 let sock = null;
 let connecting = false;
 let reconnectTimer = null;
+let waitingForPairing = false;
 
 const tg = new TelegramBot(TG_TOKEN, { polling: true });
 const isAdmin = (id) => ADMINS.includes(id);
 const tell = (t) => ADMINS.forEach(id => tg.sendMessage(id, t).catch(() => {}));
 
-// ============ PROXY ============
-let proxyAgent = null;
-if (PROXY_URL) {
-    try {
-        proxyAgent = new ProxyAgent(PROXY_URL);
-        console.log('🌐 Proxy configured:', PROXY_URL.replace(/\/\/.*@/, '//***@'));
-    } catch (e) {
-        console.error('❌ Proxy error:', e.message);
-    }
-} else {
-    console.log('⚠️ No PROXY_URL set — WhatsApp may block cloud IP');
-}
-
-// ============ QR → Telegram ============
-async function sendQR(data) {
-    try {
-        const buf = await QR.toBuffer(data, { type: 'png', width: 400, margin: 2 });
-        for (const id of ADMINS) {
-            await tg.sendPhoto(id, buf, {
-                caption: '📱 اسکن کن:\nSettings → Linked Devices → Link a Device'
-            }).catch(e => console.log('photo err:', e.message));
-        }
-        console.log('✅ QR sent to Telegram');
-    } catch (e) {
-        console.error('QR err:', e.message);
-    }
-}
-
 // ============ CONNECT WHATSAPP ============
-function connectWA() {
+async function connectWA() {
     if (connecting) return;
     connecting = true;
-    console.log('🔄 connectWA() proxy:', proxyAgent ? 'YES' : 'NO');
+    console.log('🔄 connectWA()');
 
-    useMultiFileAuthState(AUTH_DIR).then(({ state, saveCreds }) => {
-        const opts = {
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+        const { version } = await fetchLatestBaileysVersion();
+        console.log('📦 Baileys version:', version.join('.'));
+
+        const s = makeWASocket({
             auth: {
                 creds: state.creds,
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
             },
+            version,
             printQRInTerminal: false,
             logger: pino({ level: 'silent' }),
             browser: ['WhatsApp Sender', 'Chrome', '1.0.0'],
             connectTimeout: 60000,
-            defaultQueryTimeoutMs: 120000,
-        };
+            defaultQueryTimeoutMs: undefined,
+        });
 
-        if (proxyAgent) {
-            opts.agent = proxyAgent;
-        }
-
-        const s = makeWASocket(opts);
         sock = s;
-
         s.ev.on('creds.update', saveCreds);
 
-        s.ev.on('connection.update', (u) => {
+        s.ev.on('connection.update', async (u) => {
             const { connection, lastDisconnect, qr } = u;
 
             if (qr) {
-                console.log('📱 QR RECEIVED!');
+                console.log('📱 QR!');
                 connecting = false;
-                sendQR(qr);
+                tell('📱 QR کد اومد!');
+                // Try to send QR as text too
+                try {
+                    const QR = require('qrcode');
+                    const buf = await QR.toBuffer(qr, { type: 'png', width: 400, margin: 2 });
+                    for (const id of ADMINS) {
+                        await tg.sendPhoto(id, buf, { caption: '📱 اسکن کن:\nSettings → Linked Devices → Link a Device' }).catch(() => {});
+                    }
+                } catch(e) { console.log('QR photo err:', e.message); }
             }
 
             if (connection === 'open') {
                 waReady = true;
                 connecting = false;
-                console.log('✅ WA CONNECTED');
-                tell('✅ واتساپ وصل شد!');
+                waitingForPairing = false;
+                console.log('✅ WA CONNECTED!');
+                tell('✅ واتساپ وصل شد! 🎉');
             }
 
             if (connection === 'close') {
                 waReady = false;
                 const code = lastDisconnect?.error?.output?.statusCode;
-                console.log('❌ Close code:', code);
+                console.log('❌ Close:', code);
 
-                // 405/440 = connectionReplaced — DON'T reconnect
-                if (code === 440 || code === 405) {
-                    connecting = false;
-                    tell('⚠️ session جایگزین شد.\nLinked Devices رو چک کن.\n/settings بزن.');
-                    return;
-                }
+                connecting = false;
 
-                // 401 = loggedOut
                 if (code === 401) {
-                    connecting = false;
                     try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {}
                     tell('❌ خارج شد. /settings بزن.');
                     return;
                 }
 
-                // Other — reconnect
-                connecting = false;
-                if (reconnectTimer) clearTimeout(reconnectTimer);
+                if (code === 405 || code === 440) {
+                    // DON'T auto-reconnect
+                    tell('⚠️ اتصال بلاک شد. /settings بزن.');
+                    return;
+                }
+
+                // Other - reconnect
                 reconnectTimer = setTimeout(connectWA, 5000);
             }
         });
-    }).catch(err => {
-        console.error('❌ Auth err:', err.message);
+    } catch (err) {
+        console.error('❌ err:', err.message);
         connecting = false;
-        try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {}
         reconnectTimer = setTimeout(connectWA, 5000);
-    });
+    }
 }
 
+// ============ PAIRING CODE ============
+async function requestPairing() {
+    if (!sock) {
+        tell('⚠️ اتصال واتساپ نیست. اول /settings بزن.');
+        return;
+    }
+    if (!MY_NUMBER) {
+        tell('⚠️ شماره تلفن تنظیم نیست!\nوریبل MY_NUMBER رو اضافه کن.');
+        return;
+    }
+    try {
+        const code = await sock.requestPairingCode(MY_NUMBER);
+        console.log('🔑 Pairing code:', code);
+        tell(`🔑 کد Pairing:\n\n*${code}*\n\n📞 واتساپ → Settings → Linked Devices → Link with Phone Number\nکد رو وارد کن.`, { parse_mode: 'Markdown' });
+        waitingForPairing = true;
+    } catch (err) {
+        console.error('Pairing err:', err.message);
+        tell('❌ خطا در pairing: ' + err.message);
+    }
+}
+
+// ============ RESTART ============
 function restartWA() {
     tell('🔄 ریستارت...');
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (sock) { try { sock.end(undefined); } catch(e) {} sock = null; }
     waReady = false;
     connecting = false;
+    waitingForPairing = false;
     try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {}
     setTimeout(connectWA, 2000);
 }
@@ -190,7 +188,8 @@ tg.onText(/\/start/, (m) => {
     if (!isAdmin(m.from.id)) return;
     tg.sendMessage(m.from.id,
         '🤖 ربات واتساپ\n\n' +
-        '/settings - ریستارت + QR جدید\n' +
+        '/settings - ریستارت\n' +
+        '/pair - کد pairing بگیر\n' +
         '/status - وضعیت\n' +
         '/send متن - ارسال ({name})\n' +
         '/stop - توقف\n' +
@@ -204,6 +203,11 @@ tg.onText(/\/start/, (m) => {
 tg.onText(/\/settings/, (m) => {
     if (!isAdmin(m.from.id)) return;
     restartWA();
+});
+
+tg.onText(/\/pair/, (m) => {
+    if (!isAdmin(m.from.id)) return;
+    requestPairing();
 });
 
 tg.onText(/\/status/, (m) => {
@@ -279,4 +283,4 @@ if (fs.existsSync('./contacts.json')) {
     console.log(`📋 ${contacts.length} contacts`);
 }
 connectWA();
-tell('🤖 ربات آماده!\n/settings بزن');
+tell('🤖 ربات آماده!\n/settings بزن → بعد /pair بزن تا کد بیاد');
