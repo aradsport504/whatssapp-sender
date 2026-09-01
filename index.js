@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const XLSX = require('xlsx');
 const fs = require('fs');
 const pino = require('pino');
-const QRCode = require('qrcode');
+const qrcode = require('qrcode-terminal');
 
 // ============ CONFIG ============
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '8902204232:AAEw0N7UR1amMKO9xuGV8KkHyS-kym7sCmk';
@@ -22,10 +22,7 @@ let sentNumbers = new Set();
 let sendingInProgress = false;
 let messagesSentToday = 0;
 let lastResetDate = '';
-let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 5;
 let waSock = null;
-let manualRestart = false; // flag to suppress disconnect messages during manual restart
 
 // ============ TELEGRAM BOT ============
 const tgBot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
@@ -38,27 +35,15 @@ function sendToAdmin(text, opts = {}) {
     });
 }
 
-function sendQRToAdmin(qr) {
-    QRCode.toBuffer(qr, { type: 'png', width: 400 }).then(buf => {
-        ADMIN_IDS.forEach(id => {
-            tgBot.sendPhoto(id, buf, {
-                caption: '📱 QR Code واتساپ\n\nگوشیت رو باز کن:\nSettings → Linked Devices → Link a Device\n\n⏳ اسکن کن.'
-            }).catch(e => console.log('TG photo error:', e.message));
-        });
-    }).catch(e => console.log('QR error:', e.message));
-}
-
 // ============ WHATSAPP ============
 async function connectWhatsApp() {
     try {
-        // Destroy old socket first
         if (waSock) {
             try { waSock.end(undefined); } catch(e) {}
             waSock = null;
         }
 
         console.log('🔄 Connecting to WhatsApp...');
-
         const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
         waSock = makeWASocket({
@@ -79,10 +64,21 @@ async function connectWhatsApp() {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr) {
-                console.log('📱 QR received, sending to Telegram...');
-                reconnectAttempts = 0;
-                manualRestart = false;
-                sendQRToAdmin(qr);
+                console.log('📱 QR CODE RECEIVED');
+                // Send QR as text to admin
+                sendToAdmin('📱 کیو آر کد واتساپ:\n\nگوشیت رو باز کن:\nSettings → Linked Devices → Link a Device\n\n⚠️ اگه این کد کار نکرد، ربات ۳۰ ثانیه دیگه ریستارت میشه و QR جدید میاد.');
+                // Also try to send as image via qrcode-terminal to console and capture
+                qrcode.generate(qr, { small: true }, (qrText) => {
+                    // Split QR text into chunks for Telegram (max 4096 chars)
+                    const chunks = qrText.match(/.{1,4000}/g) || [qrText];
+                    chunks.forEach((chunk, i) => {
+                        ADMIN_IDS.forEach(id => {
+                            tgBot.sendMessage(id, '```\n' + chunk + '\n```', { parse_mode: 'Markdown' }).catch(() => {
+                                tgBot.sendMessage(id, chunk).catch(e => console.log('TG chunk error:', e.message));
+                            });
+                        });
+                    });
+                });
             }
 
             if (connection === 'close') {
@@ -90,41 +86,18 @@ async function connectWhatsApp() {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 console.log(`❌ Connection closed. Status: ${statusCode}`);
 
-                // If this is a manual restart, don't send disconnect messages
-                // (the QR will come from the new connection)
-                if (manualRestart) {
-                    console.log('🔄 Manual restart in progress, skipping disconnect notification');
-                    return;
-                }
-
                 if (statusCode === DisconnectReason.loggedOut) {
-                    reconnectAttempts = 0;
-                    sendToAdmin('❌ واتساپ از اکانت خارج شد!\n/settings بزن تا QR جدید بیاد.');
+                    sendToAdmin('❌ واتساپ logout شد!\n/start بزن تا ریستارت شه.');
                     try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {}
-                } else if (statusCode === DisconnectReason.connectionClosed ||
-                           statusCode === DisconnectReason.connectionLost ||
-                           statusCode === DisconnectReason.connectionReplaced ||
-                           statusCode === DisconnectReason.timedOut) {
-                    reconnectAttempts++;
-                    if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
-                        const delay = Math.min(reconnectAttempts * 5000, 30000);
-                        console.log(`🔄 Auto-reconnect ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay/1000}s`);
-                        setTimeout(() => connectWhatsApp(), delay);
-                    } else {
-                        reconnectAttempts = 0;
-                        sendToAdmin('⚠️ واتساپ قطع شد و وصل نشد.\n/settings بزن تا QR جدید بیاد.');
-                    }
                 } else {
-                    reconnectAttempts = 0;
-                    sendToAdmin('⚠️ واتساپ قطع شد.\n/settings بزن تا QR جدید بیاد.');
-                    try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {}
+                    // Auto reconnect
+                    console.log('🔄 Auto-reconnecting in 5s...');
+                    setTimeout(() => connectWhatsApp(), 5000);
                 }
             }
 
             if (connection === 'open') {
                 whatsappReady = true;
-                reconnectAttempts = 0;
-                manualRestart = false;
                 console.log('✅ WhatsApp connected!');
                 sendToAdmin('✅ واتساپ وصل شد! 🎉');
             }
@@ -132,36 +105,6 @@ async function connectWhatsApp() {
     } catch (err) {
         console.error('❌ connectWhatsApp error:', err);
         sendToAdmin(`❌ خطا در اتصال:\n${err.message}`);
-    }
-}
-
-async function requestNewQR() {
-    try {
-        console.log('⚙️ Requesting new QR...');
-        manualRestart = true; // suppress old disconnect messages
-        
-        // Destroy old socket
-        if (waSock) {
-            try { waSock.end(undefined); } catch(e) {}
-            waSock = null;
-        }
-        whatsappReady = false;
-        reconnectAttempts = 0;
-
-        // Delete old auth to force new QR
-        if (fs.existsSync(AUTH_DIR)) {
-            fs.rmSync(AUTH_DIR, { recursive: true });
-        }
-
-        // Small delay to let old socket fully close
-        await new Promise(r => setTimeout(r, 1000));
-
-        // Connect fresh
-        await connectWhatsApp();
-    } catch (err) {
-        console.error('❌ requestNewQR error:', err);
-        sendToAdmin(`❌ خطا: ${err.message}`);
-        manualRestart = false;
     }
 }
 
@@ -233,7 +176,7 @@ tgBot.onText(/\/start/, (msg) => {
     if (!isAdmin(msg.from.id)) return;
     tgBot.sendMessage(msg.from.id,
         `🤖 ربات واتساپ\n\n` +
-        `/settings - QR جدید\n` +
+        `/settings - QR جدید (ریستارت)\n` +
         `/status - وضعیت\n` +
         `/send متن - ارسال\n` +
         `/stop - توقف\n` +
@@ -245,11 +188,12 @@ tgBot.onText(/\/start/, (msg) => {
     );
 });
 
+// /settings = delete auth + restart process (Railway auto-restarts)
 tgBot.onText(/\/settings/, (msg) => {
     if (!isAdmin(msg.from.id)) return;
-    console.log(`⚙️ /settings from ${msg.from.id}`);
-    sendToAdmin('🔄 در حال دریافت QR کد...');
-    requestNewQR();
+    sendToAdmin('🔄 ریستارت... ۳۰ ثانیه صبر کن، QR جدید میاد.');
+    try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {}
+    setTimeout(() => process.exit(0), 1000); // Railway auto-restarts
 });
 
 tgBot.onText(/\/status/, (msg) => {
