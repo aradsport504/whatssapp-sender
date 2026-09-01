@@ -149,6 +149,7 @@ async function startSend(tpl) {
 const HELP = '🤖 ربات واتساپ\n\n' +
     '/qr - QR کد واتساپ\n' +
     '/pair - کد Pairing\n' +
+    '/test شماره پیام - تست ارسال\n' +
     '/status - وضعیت\n' +
     '/send متن - ارسال ({name})\n' +
     '/stop - توقف\n' +
@@ -195,6 +196,23 @@ async function doPairing() {
         tell('❌ خطا: ' + err.message);
     }
 }
+
+// /test شماره پیام - تست ارسال به یه شماره
+tg.onText(/\/test (\d+)\s+(.+)/, async (m, match) => {
+    if (!isAdmin(m.from.id)) return;
+    if (!waReady || !sock) return tg.sendMessage(m.from.id, '⚠️ واتساپ وصل نیست!');
+    const num = match[1];
+    const msg = match[2];
+    const jid = num + '@s.whatsapp.net';
+    try {
+        const [r] = await sock.onWhatsApp(jid);
+        if (!r.exists) return tg.sendMessage(m.from.id, `❌ شماره ${num} واتساپ نداره`);
+        await sock.sendMessage(jid, { text: msg });
+        tg.sendMessage(m.from.id, `✅ پیام فرستاده شد به ${num}\n📝 ${msg}`);
+    } catch (e) {
+        tg.sendMessage(m.from.id, `❌ خطا: ${e.message}`);
+    }
+});
 
 tg.onText(/\/status/, (m) => {
     if (!isAdmin(m.from.id)) return;
