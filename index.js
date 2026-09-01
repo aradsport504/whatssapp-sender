@@ -8,12 +8,12 @@ const QRCode = require('qrcode');
 
 // ============ CONFIG ============
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '8902204232:AAEw0N7UR1amMKO9xuGV8KkHyS-kym7sCmk';
-const ADMIN_IDS = [6138410965]; // Add more IDs with /addaccess
+const ADMIN_IDS = (process.env.ADMIN_IDS || '6138410965').split(',').map(Number);
 const MESSAGES_PER_DAY = 35;
-const DELAY_MIN_MS = 3 * 60 * 1000;  // 3 minutes
-const DELAY_MAX_MS = 5 * 60 * 1000;  // 5 minutes
-const SEND_START_HOUR = 8;  // 8 AM
-const SEND_END_HOUR = 22;   // 10 PM
+const DELAY_MIN_MS = 3 * 60 * 1000;
+const DELAY_MAX_MS = 5 * 60 * 1000;
+const SEND_START_HOUR = 8;
+const SEND_END_HOUR = 22;
 const AUTH_DIR = './auth_info';
 
 // ============ STATE ============
@@ -23,6 +23,9 @@ let sentNumbers = new Set();
 let sendingInProgress = false;
 let messagesSentToday = 0;
 let lastResetDate = '';
+let reconnecting = false;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
 
 // ============ TELEGRAM BOT ============
 const tgBot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
@@ -39,9 +42,6 @@ function sendToAdmin(text, options = {}) {
 
 // ============ WHATSAPP ============
 let sock;
-let reconnecting = false;
-let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 5;
 
 async function connectWhatsApp() {
     if (reconnecting) return;
@@ -72,7 +72,7 @@ async function connectWhatsApp() {
             const qrImage = await QRCode.toBuffer(qr, { type: 'png', width: 400 });
             ADMIN_IDS.forEach(id => {
                 tgBot.sendPhoto(id, qrImage, {
-                    caption: '📱 QR Code واتساپ\n\nگوشیت رو باز کن و این کد رو اسکن کن:\nSettings → Linked Devices → Link a Device\n\n⏳ تا اسکن صبر کن، بعد از اتصال پیام میدم.'
+                    caption: '📱 QR Code واتساپ\n\nگوشیت رو باز کن و این کد رو اسکن کن:\nSettings → Linked Devices → Link a Device\n\n⏳ تا اسکن صبر کن.'
                 }).catch(() => {});
             });
         }
@@ -80,13 +80,12 @@ async function connectWhatsApp() {
         if (connection === 'close') {
             whatsappReady = false;
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const errorReason = lastDisconnect?.error?.output?.payload?.error;
 
-            console.log(`Connection closed. Status: ${statusCode}, Reason: ${errorReason}`);
+            console.log(`Connection closed. Status: ${statusCode}`);
 
             if (statusCode === DisconnectReason.loggedOut) {
                 reconnecting = false;
-                sendToAdmin('❌ واتساپ از اکانت خارج شد! دوباره اسکن کن.\n/settings رو بزن تا QR جدید بیاد.');
+                sendToAdmin('❌ واتساپ از اکانت خارج شد!\n/settings رو بزن تا QR جدید بیاد.');
                 if (fs.existsSync(AUTH_DIR)) {
                     fs.rmSync(AUTH_DIR, { recursive: true });
                 }
@@ -125,6 +124,17 @@ async function connectWhatsApp() {
     });
 }
 
+async function requestNewQR() {
+    if (fs.existsSync(AUTH_DIR)) {
+        fs.rmSync(AUTH_DIR, { recursive: true });
+    }
+    reconnecting = false;
+    reconnectAttempts = 0;
+    whatsappReady = false;
+    sendToAdmin('🔄 در حال اتصال مجدد به واتساپ...');
+    await connectWhatsApp();
+}
+
 // ============ MESSAGE SENDING ============
 function randomDelay() {
     return DELAY_MIN_MS + Math.random() * (DELAY_MAX_MS - DELAY_MIN_MS);
@@ -152,7 +162,6 @@ async function sendMessageToContact(contact, messageTemplate) {
         return false;
     }
 
-    // Personalize message with name
     let message = messageTemplate;
     if (contact.name) {
         message = message.replace(/{name}/g, contact.name);
@@ -165,7 +174,6 @@ async function sendMessageToContact(contact, messageTemplate) {
     const jid = number + '@s.whatsapp.net';
 
     try {
-        // Check if number exists on WhatsApp
         const [exists] = await sock.onWhatsApp(jid);
         if (!exists.exists) {
             console.log(`❌ Number not on WhatsApp: ${number}`);
@@ -237,7 +245,6 @@ async function startSending(messageTemplate) {
             messagesSentToday++;
             sentNumbers.add(numClean);
 
-            // Save progress
             fs.writeFileSync('./progress.json', JSON.stringify({
                 sent: Array.from(sentNumbers),
                 total: contacts.length,
@@ -247,12 +254,10 @@ async function startSending(messageTemplate) {
             failedCount++;
         }
 
-        // Progress update every 5 messages
         if (sentCount % 5 === 0 && sentCount > 0) {
             sendToAdmin(`📊 پیشرفت: ${sentCount}/${contacts.length} ✅ | ${failedCount} ❌ | 📅 امروز: ${messagesSentToday}/${MESSAGES_PER_DAY}`);
         }
 
-        // Wait before next message
         if (i < contacts.length - 1) {
             const delay = randomDelay();
             const delayMin = Math.round(delay / 60000);
@@ -274,6 +279,7 @@ tgBot.onText(/\/start/, (msg) => {
         `🤖 ربات کنترل واتساپ\n\n` +
         `دستورات:\n` +
         `/status - وضعیت واتساپ\n` +
+        `/settings - تنظیمات + QR جدید\n` +
         `/send متن پیام - شروع ارسال\n` +
         `/stop - توقف ارسال\n` +
         `/contacts - نمایش لیست شماره‌ها\n` +
@@ -283,6 +289,13 @@ tgBot.onText(/\/start/, (msg) => {
         `/accesslist - لیست دسترسی‌ها\n` +
         `\n📎 فایل اکسل بفرست تا لیست شماره‌ها آپلود بشه`
     );
+});
+
+// /settings - get new QR
+tgBot.onText(/\/settings/, (msg) => {
+    if (!isAdmin(msg.from.id)) return;
+    tgBot.sendMessage(msg.from.id, '🔄 در حال دریافت QR کد جدید...');
+    requestNewQR();
 });
 
 // /status
@@ -348,11 +361,7 @@ tgBot.onText(/\/limit/, (msg) => {
         `📨 ارسال شده امروز: ${messagesSentToday}\n` +
         `剩 باقی‌مانده: ${Math.max(0, remaining)}\n\n` +
         `⏰ فاصله ارسال: ${Math.round(DELAY_MIN_MS/60000)}-${Math.round(DELAY_MAX_MS/60000)} دقیقه\n` +
-        `🕐 ساعات ارسال: ${SEND_START_HOUR}:00 تا ${SEND_END_HOUR}:00\n\n` +
-        `⚠️ نکات امنیتی:\n` +
-        `- بیشتر از ${MESSAGES_PER_DAY} پیام در روز نفرست\n` +
-        `- بین هر پیام ${Math.round(DELAY_MIN_MS/60000)}-${Math.round(DELAY_MAX_MS/60000)} دقیقه فاصله بذار\n` +
-        `- فقط در ساعات مجاز ارسال کن`
+        `🕐 ساعات ارسال: ${SEND_START_HOUR}:00 تا ${SEND_END_HOUR}:00`
     );
 });
 
@@ -424,9 +433,7 @@ tgBot.on('document', async (msg) => {
 
         contacts = [];
         data.forEach(row => {
-            // Find phone column (try common names)
             const phone = row['شماره'] || row['phone'] || row['Phone'] || row['شماره تلفن'] || row['شماره_تلفن'] || Object.values(row)[0];
-            // Find name column
             const name = row['اسم'] || row['name'] || row['Name'] || row['نام'] || row['نام_خانوادگی'] || Object.values(row)[1] || '';
 
             if (phone) {
@@ -437,7 +444,6 @@ tgBot.on('document', async (msg) => {
             }
         });
 
-        // Save contacts
         fs.writeFileSync('./contacts.json', JSON.stringify(contacts, null, 2));
 
         let list = `✅ فایل آپلود شد!\n📋 تعداد شماره‌ها: ${contacts.length}\n\n`;
@@ -458,17 +464,15 @@ tgBot.on('document', async (msg) => {
 async function main() {
     console.log('🚀 Starting WhatsApp Sender Bot...');
 
-    // Load saved contacts
     if (fs.existsSync('./contacts.json')) {
         contacts = JSON.parse(fs.readFileSync('./contacts.json', 'utf8'));
         console.log(`📋 Loaded ${contacts.length} contacts`);
     }
 
-    // Connect WhatsApp
     await connectWhatsApp();
 
     console.log('✅ Bot is ready!');
-    sendToAdmin('🤖 ربات واتساپ آماده شد!\n\nبرای شروع:\n1. QR کد رو اسکن کن\n2. فایل اکسل بفرست\n3. /send متن پیام بزن');
+    sendToAdmin('🤖 ربات واتساپ آماده شد!\n\nبرای شروع:\n1. /settings بزن تا QR کد بیاد\n2. اسکن کن\n3. فایل اکسل بفرست\n4. /send متن پیام بزن');
 }
 
 main().catch(console.error);
