@@ -1,0 +1,6 @@
+auth_info/
+node_modules/
+.env
+progress.json
+contacts.json
+*.log
