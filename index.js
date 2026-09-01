@@ -23,9 +23,10 @@ let sentNumbers = new Set();
 let sendingInProgress = false;
 let messagesSentToday = 0;
 let lastResetDate = '';
-let reconnecting = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
+let waSock = null;
+let waEvCleanup = null;
 
 // ============ TELEGRAM BOT ============
 const tgBot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
@@ -36,103 +37,110 @@ function isAdmin(userId) {
 
 function sendToAdmin(text, options = {}) {
     ADMIN_IDS.forEach(id => {
-        tgBot.sendMessage(id, text, options).catch(() => {});
+        tgBot.sendMessage(id, text, options).catch(e => console.log('TG send error:', e.message));
     });
+}
+
+function sendQRToAdmin(qr) {
+    QRCode.toBuffer(qr, { type: 'png', width: 400 }).then(qrImage => {
+        ADMIN_IDS.forEach(id => {
+            tgBot.sendPhoto(id, qrImage, {
+                caption: '📱 QR Code واتساپ\n\nگوشیت رو باز کن:\nSettings → Linked Devices → Link a Device\n\n⏳ اسکن کن تا وصل بشه.'
+            }).catch(e => console.log('TG photo error:', e.message));
+        });
+    }).catch(e => console.log('QR generate error:', e.message));
 }
 
 // ============ WHATSAPP ============
-let sock;
-
 async function connectWhatsApp() {
-    if (reconnecting) return;
-    reconnecting = true;
+    try {
+        console.log('🔄 Connecting to WhatsApp...');
 
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+        const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
-    sock = makeWASocket({
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
-        },
-        printQRInTerminal: false,
-        logger: pino({ level: 'silent' }),
-        browser: ['WhatsApp Sender', 'Chrome', '1.0.0'],
-        connectTimeout: 60000,
-        keepAliveIntervalMs: 30000,
-    });
+        waSock = makeWASocket({
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+            },
+            printQRInTerminal: false,
+            logger: pino({ level: 'silent' }),
+            browser: ['WhatsApp Sender', 'Chrome', '1.0.0'],
+            connectTimeout: 60000,
+            keepAliveIntervalMs: 30000,
+        });
 
-    sock.ev.on('creds.update', saveCreds);
+        waSock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
+        waSock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
 
-        if (qr) {
-            reconnecting = false;
-            reconnectAttempts = 0;
-            const qrImage = await QRCode.toBuffer(qr, { type: 'png', width: 400 });
-            ADMIN_IDS.forEach(id => {
-                tgBot.sendPhoto(id, qrImage, {
-                    caption: '📱 QR Code واتساپ\n\nگوشیت رو باز کن و این کد رو اسکن کن:\nSettings → Linked Devices → Link a Device\n\n⏳ تا اسکن صبر کن.'
-                }).catch(() => {});
-            });
-        }
+            if (qr) {
+                console.log('📱 QR received, sending to Telegram...');
+                reconnectAttempts = 0;
+                sendQRToAdmin(qr);
+            }
 
-        if (connection === 'close') {
-            whatsappReady = false;
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            if (connection === 'close') {
+                whatsappReady = false;
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                console.log(`❌ Connection closed. Status: ${statusCode}`);
 
-            console.log(`Connection closed. Status: ${statusCode}`);
-
-            if (statusCode === DisconnectReason.loggedOut) {
-                reconnecting = false;
-                sendToAdmin('❌ واتساپ از اکانت خارج شد!\n/settings رو بزن تا QR جدید بیاد.');
-                if (fs.existsSync(AUTH_DIR)) {
-                    fs.rmSync(AUTH_DIR, { recursive: true });
-                }
-            } else if (statusCode === DisconnectReason.connectionClosed ||
-                       statusCode === DisconnectReason.connectionLost ||
-                       statusCode === DisconnectReason.connectionReplaced ||
-                       statusCode === DisconnectReason.timedOut) {
-                reconnectAttempts++;
-                if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
-                    const delay = Math.min(reconnectAttempts * 5000, 30000);
-                    console.log(`Reconnecting in ${delay/1000}s (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-                    setTimeout(() => {
-                        reconnecting = false;
-                        connectWhatsApp();
-                    }, delay);
-                } else {
-                    reconnecting = false;
+                if (statusCode === DisconnectReason.loggedOut) {
                     reconnectAttempts = 0;
-                    sendToAdmin('⚠️ واتساپ قطع شد و پس از ۵ بار تلاش وصل نشد.\n/settings رو بزن تا QR جدید بیاد.');
-                }
-            } else {
-                reconnecting = false;
-                sendToAdmin(`⚠️ واتساپ قطع شد (کد: ${statusCode}). لطفاً دوباره اسکن کن.`);
-                if (fs.existsSync(AUTH_DIR)) {
-                    fs.rmSync(AUTH_DIR, { recursive: true });
+                    sendToAdmin('❌ واتساپ از اکانت خارج شد!\n/settings رو بزن تا QR جدید بیاد.');
+                    try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {}
+                } else if (statusCode === DisconnectReason.connectionClosed ||
+                           statusCode === DisconnectReason.connectionLost ||
+                           statusCode === DisconnectReason.connectionReplaced ||
+                           statusCode === DisconnectReason.timedOut) {
+                    reconnectAttempts++;
+                    if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+                        const delay = Math.min(reconnectAttempts * 5000, 30000);
+                        console.log(`🔄 Reconnecting in ${delay/1000}s (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+                        setTimeout(() => { connectWhatsApp(); }, delay);
+                    } else {
+                        reconnectAttempts = 0;
+                        sendToAdmin('⚠️ واتساپ قطع شد.\n/settings بزن تا QR جدید بیاد.');
+                    }
+                } else {
+                    reconnectAttempts = 0;
+                    sendToAdmin(`⚠️ واتساپ قطع شد.\n/settings بزن تا QR جدید بیاد.`);
+                    try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {}
                 }
             }
-        }
 
-        if (connection === 'open') {
-            whatsappReady = true;
-            reconnecting = false;
-            reconnectAttempts = 0;
-            sendToAdmin('✅ واتساپ با موفقیت وصل شد! 🎉');
-        }
-    });
+            if (connection === 'open') {
+                whatsappReady = true;
+                reconnectAttempts = 0;
+                console.log('✅ WhatsApp connected!');
+                sendToAdmin('✅ واتساپ وصل شد! 🎉');
+            }
+        });
+    } catch (err) {
+        console.error('❌ connectWhatsApp error:', err);
+        sendToAdmin(`❌ خطا در اتصال واتساپ:\n${err.message}`);
+    }
 }
 
 async function requestNewQR() {
-    if (fs.existsSync(AUTH_DIR)) {
-        fs.rmSync(AUTH_DIR, { recursive: true });
+    try {
+        // Destroy old connection
+        if (waSock) {
+            try { waSock.end(undefined); } catch(e) {}
+            waSock = null;
+        }
+        // Clear old auth
+        if (fs.existsSync(AUTH_DIR)) {
+            fs.rmSync(AUTH_DIR, { recursive: true });
+        }
+        reconnectAttempts = 0;
+        whatsappReady = false;
+        await connectWhatsApp();
+    } catch (err) {
+        console.error('❌ requestNewQR error:', err);
+        sendToAdmin(`❌ خطا: ${err.message}`);
     }
-    reconnecting = false;
-    reconnectAttempts = 0;
-    whatsappReady = false;
-    sendToAdmin('🔄 در حال اتصال مجدد به واتساپ...');
-    await connectWhatsApp();
 }
 
 // ============ MESSAGE SENDING ============
@@ -141,8 +149,7 @@ function randomDelay() {
 }
 
 function isAllowedTime() {
-    const now = new Date();
-    const hour = now.getHours();
+    const hour = new Date().getHours();
     return hour >= SEND_START_HOUR && hour < SEND_END_HOUR;
 }
 
@@ -152,327 +159,210 @@ function resetDailyCounter() {
         messagesSentToday = 0;
         lastResetDate = today;
         sentNumbers.clear();
-        console.log(`🔄 Daily counter reset: ${today}`);
     }
 }
 
 async function sendMessageToContact(contact, messageTemplate) {
-    if (!whatsappReady) {
-        sendToAdmin('⚠️ واتساپ وصل نیست! ارسال متوقف شد.');
+    if (!whatsappReady || !waSock) {
+        sendToAdmin('⚠️ واتساپ وصل نیست!');
         return false;
     }
 
     let message = messageTemplate;
-    if (contact.name) {
-        message = message.replace(/{name}/g, contact.name);
-    }
-    if (contact.lastname) {
-        message = message.replace(/{lastname}/g, contact.lastname);
-    }
+    if (contact.name) message = message.replace(/{name}/g, contact.name);
+    if (contact.lastname) message = message.replace(/{lastname}/g, contact.lastname);
 
     const number = contact.number.replace(/[^0-9]/g, '');
     const jid = number + '@s.whatsapp.net';
 
     try {
-        const [exists] = await sock.onWhatsApp(jid);
-        if (!exists.exists) {
-            console.log(`❌ Number not on WhatsApp: ${number}`);
-            return false;
-        }
-
-        await sock.sendMessage(jid, { text: message });
-        console.log(`✅ Sent to ${number} (${contact.name || 'Unknown'})`);
+        const [exists] = await waSock.onWhatsApp(jid);
+        if (!exists.exists) return false;
+        await waSock.sendMessage(jid, { text: message });
         return true;
     } catch (err) {
-        console.error(`❌ Failed to send to ${number}:`, err.message);
+        console.error(`❌ Send failed ${number}:`, err.message);
         return false;
     }
 }
 
 async function startSending(messageTemplate) {
-    if (sendingInProgress) {
-        sendToAdmin('⚠️ ارسال در حال انجام است!');
-        return;
-    }
-
-    if (!whatsappReady) {
-        sendToAdmin('⚠️ واتساپ وصل نیست! اول QR کد رو اسکن کن.');
-        return;
-    }
-
-    if (contacts.length === 0) {
-        sendToAdmin('⚠️ لیست شماره‌ها خالیه! فایل اکسل رو بفرست.');
-        return;
-    }
+    if (sendingInProgress) return sendToAdmin('⚠️ ارسال در حال انجام است!');
+    if (!whatsappReady) return sendToAdmin('⚠️ واتساپ وصل نیست!');
+    if (contacts.length === 0) return sendToAdmin('⚠️ لیست شماره‌ها خالیه!');
 
     sendingInProgress = true;
     resetDailyCounter();
-    let sentCount = 0;
-    let failedCount = 0;
+    let sentCount = 0, failedCount = 0;
 
-    sendToAdmin(`🚀 شروع ارسال!\n📱 تعداد کل: ${contacts.length}\n⏰ هر ${Math.round(DELAY_MIN_MS/60000)}-${Math.round(DELAY_MAX_MS/60000)} دقیقه یک پیام`);
+    sendToAdmin(`🚀 شروع ارسال!\n📱 تعداد: ${contacts.length}\n⏰ هر ${Math.round(DELAY_MIN_MS/60000)}-${Math.round(DELAY_MAX_MS/60000)} دقیقه`);
 
     for (let i = 0; i < contacts.length; i++) {
-        if (!sendingInProgress) {
-            sendToAdmin('🛑 ارسال متوقف شد.');
-            break;
-        }
-
+        if (!sendingInProgress) { sendToAdmin('🛑 متوقف شد.'); break; }
         resetDailyCounter();
-
-        if (messagesSentToday >= MESSAGES_PER_DAY) {
-            sendToAdmin(`⏸️ لیمیت روزانه رسید (${MESSAGES_PER_DAY} پیام). فردا ادامه میده.`);
-            break;
-        }
-
-        if (!isAllowedTime()) {
-            const now = new Date();
-            sendToAdmin(`⏸️ خارج از ساعات ارسال (${now.getHours()}:00). تا ساعت ${SEND_START_HOUR} صبح صبر کن.`);
-            break;
-        }
+        if (messagesSentToday >= MESSAGES_PER_DAY) { sendToAdmin(`⏸️ لیمیت روزانه (${MESSAGES_PER_DAY}).`); break; }
+        if (!isAllowedTime()) { sendToAdmin(`⏸️ خارج از ساعات ارسال.`); break; }
 
         const contact = contacts[i];
         const numClean = contact.number.replace(/[^0-9]/g, '');
-        if (sentNumbers.has(numClean)) {
-            console.log(`⏭️ Already sent to ${numClean}, skipping`);
-            continue;
-        }
+        if (sentNumbers.has(numClean)) continue;
 
         const success = await sendMessageToContact(contact, messageTemplate);
-
         if (success) {
-            sentCount++;
-            messagesSentToday++;
-            sentNumbers.add(numClean);
-
-            fs.writeFileSync('./progress.json', JSON.stringify({
-                sent: Array.from(sentNumbers),
-                total: contacts.length,
-                date: new Date().toISOString()
-            }, null, 2));
-        } else {
-            failedCount++;
-        }
+            sentCount++; messagesSentToday++; sentNumbers.add(numClean);
+            fs.writeFileSync('./progress.json', JSON.stringify({ sent: Array.from(sentNumbers), date: new Date().toISOString() }));
+        } else { failedCount++; }
 
         if (sentCount % 5 === 0 && sentCount > 0) {
-            sendToAdmin(`📊 پیشرفت: ${sentCount}/${contacts.length} ✅ | ${failedCount} ❌ | 📅 امروز: ${messagesSentToday}/${MESSAGES_PER_DAY}`);
+            sendToAdmin(`📊 ${sentCount}/${contacts.length} ✅ | ${failedCount} ❌`);
         }
 
         if (i < contacts.length - 1) {
-            const delay = randomDelay();
-            const delayMin = Math.round(delay / 60000);
-            console.log(`⏳ Waiting ${delayMin} minutes...`);
-            await new Promise(resolve => setTimeout(resolve, delay));
+            await new Promise(resolve => setTimeout(resolve, randomDelay()));
         }
     }
 
     sendingInProgress = false;
-    sendToAdmin(`✅ ارسال تمام شد!\n✅ موفق: ${sentCount}\n❌ ناموفق: ${failedCount}\n📅 ارسال شده امروز: ${messagesSentToday}`);
+    sendToAdmin(`✅ تمام شد! ✅${sentCount} ❌${failedCount} 📅${messagesSentToday}`);
 }
 
 // ============ TELEGRAM COMMANDS ============
 
-// /start
 tgBot.onText(/\/start/, (msg) => {
     if (!isAdmin(msg.from.id)) return;
     tgBot.sendMessage(msg.from.id,
-        `🤖 ربات کنترل واتساپ\n\n` +
-        `دستورات:\n` +
-        `/status - وضعیت واتساپ\n` +
-        `/settings - تنظیمات + QR جدید\n` +
-        `/send متن پیام - شروع ارسال\n` +
+        `🤖 ربات واتساپ\n\n` +
+        `/settings - QR جدید\n` +
+        `/status - وضعیت\n` +
+        `/send متن - ارسال (متن باید {name} داشته باشه)\n` +
         `/stop - توقف ارسال\n` +
-        `/contacts - نمایش لیست شماره‌ها\n` +
-        `/limit - نمایش لیمیت ارسال\n` +
-        `/addaccess [ID] - اضافه کردن دسترسی\n` +
-        `/removeaccess [ID] - حذف دسترسی\n` +
+        `/contacts - لیست شماره‌ها\n` +
+        `/limit - لیمیت ارسال\n` +
+        `/addaccess [ID] - اضافه دسترسی\n` +
         `/accesslist - لیست دسترسی‌ها\n` +
-        `\n📎 فایل اکسل بفرست تا لیست شماره‌ها آپلود بشه`
+        `\n📎 فایل اکسل بفرست`
     );
 });
 
-// /settings - get new QR
 tgBot.onText(/\/settings/, (msg) => {
     if (!isAdmin(msg.from.id)) return;
-    tgBot.sendMessage(msg.from.id, '🔄 در حال دریافت QR کد جدید...');
+    console.log(`⚙️ /settings requested by ${msg.from.id}`);
+    tgBot.sendMessage(msg.from.id, '🔄 دریافت QR جدید...');
     requestNewQR();
 });
 
-// /status
 tgBot.onText(/\/status/, (msg) => {
     if (!isAdmin(msg.from.id)) return;
-    const status = whatsappReady ? '✅ وصل' : '❌ قطع';
-    const today = new Date().toDateString();
-    if (lastResetDate !== today) messagesSentToday = 0;
+    resetDailyCounter();
     tgBot.sendMessage(msg.from.id,
-        `📱 وضعیت واتساپ: ${status}\n` +
-        `📋 تعداد شماره‌ها: ${contacts.length}\n` +
-        `📨 ارسال شده امروز: ${messagesSentToday}/${MESSAGES_PER_DAY}\n` +
-        `🔄 در حال ارسال: ${sendingInProgress ? 'بله' : 'خیر'}\n` +
-        `⏰ ساعات ارسال: ${SEND_START_HOUR}:00 - ${SEND_END_HOUR}:00`
+        `📱 واتساپ: ${whatsappReady ? '✅ وصل' : '❌ قطع'}\n` +
+        `📋 شماره‌ها: ${contacts.length}\n` +
+        `📨 امروز: ${messagesSentToday}/${MESSAGES_PER_DAY}\n` +
+        `🔄 ارسال: ${sendingInProgress ? 'بله' : 'خیر'}`
     );
 });
 
-// /stop
 tgBot.onText(/\/stop/, (msg) => {
     if (!isAdmin(msg.from.id)) return;
     sendingInProgress = false;
-    tgBot.sendMessage(msg.from.id, '🛑 ارسال متوقف شد.');
+    tgBot.sendMessage(msg.from.id, '🛑 متوقف شد.');
 });
 
-// /send
 tgBot.onText(/\/send (.+)/, (msg, match) => {
     if (!isAdmin(msg.from.id)) return;
-    const messageTemplate = match[1];
-    if (!messageTemplate.includes('{name}')) {
-        tgBot.sendMessage(msg.from.id,
-            '⚠️ متن پیام باید شامل `{name}` باشه.\n\nمثال:\nسلام {name} 👋 مجموعه ما برای شما تخفیف ویژه دارد.'
-        );
-        return;
+    const tpl = match[1];
+    if (!tpl.includes('{name}')) {
+        return tgBot.sendMessage(msg.from.id, '⚠️ متن باید `{name}` داشته باشه.\nمثال: سلام {name} 👋');
     }
-    tgBot.sendMessage(msg.from.id, `✅ متن پیام ثبت شد.\n\n📝 متن:\n${messageTemplate}\n\n🚀 در حال شروع ارسال...`);
-    startSending(messageTemplate);
+    tgBot.sendMessage(msg.from.id, `✅ ثبت شد:\n${tpl}\n\n🚀 شروع...`);
+    startSending(tpl);
 });
 
-// /contacts
 tgBot.onText(/\/contacts/, (msg) => {
     if (!isAdmin(msg.from.id)) return;
-    if (contacts.length === 0) {
-        tgBot.sendMessage(msg.from.id, '📋 لیست شماره‌ها خالیه. فایل اکسل بفرست.');
-        return;
-    }
-    let list = '📋 لیست شماره‌ها:\n\n';
-    contacts.slice(0, 20).forEach((c, i) => {
-        list += `${i+1}. ${c.number} - ${c.name || 'بدون اسم'}\n`;
-    });
-    if (contacts.length > 20) {
-        list += `\n... و ${contacts.length - 20} شماره دیگر`;
-    }
-    tgBot.sendMessage(msg.from.id, list);
+    if (!contacts.length) return tgBot.sendMessage(msg.from.id, 'خالیه. فایل اکسل بفرست.');
+    let list = contacts.slice(0, 20).map((c, i) => `${i+1}. ${c.number} - ${c.name || '-'}`).join('\n');
+    if (contacts.length > 20) list += `\n... +${contacts.length - 20}`;
+    tgBot.sendMessage(msg.from.id, `📋 شماره‌ها (${contacts.length}):\n\n${list}`);
 });
 
-// /limit
 tgBot.onText(/\/limit/, (msg) => {
     if (!isAdmin(msg.from.id)) return;
-    const remaining = MESSAGES_PER_DAY - messagesSentToday;
+    resetDailyCounter();
     tgBot.sendMessage(msg.from.id,
-        `📊 لیمیت ارسال:\n\n` +
-        `📅 حداکثر روزانه: ${MESSAGES_PER_DAY} پیام\n` +
-        `📨 ارسال شده امروز: ${messagesSentToday}\n` +
-        `剩 باقی‌مانده: ${Math.max(0, remaining)}\n\n` +
-        `⏰ فاصله ارسال: ${Math.round(DELAY_MIN_MS/60000)}-${Math.round(DELAY_MAX_MS/60000)} دقیقه\n` +
-        `🕐 ساعات ارسال: ${SEND_START_HOUR}:00 تا ${SEND_END_HOUR}:00`
+        `📊 روزانه: ${messagesSentToday}/${MESSAGES_PER_DAY}\n⏰ ${Math.round(DELAY_MIN_MS/60000)}-${Math.round(DELAY_MAX_MS/60000)} دقیقه فاصله\n🕐 ${SEND_START_HOUR}:00 تا ${SEND_END_HOUR}:00`
     );
 });
 
-// /addaccess
 tgBot.onText(/\/addaccess (.+)/, (msg, match) => {
     if (!isAdmin(msg.from.id)) return;
-    const newId = parseInt(match[1]);
-    if (isNaN(newId)) {
-        tgBot.sendMessage(msg.from.id, '❌ آی‌دی نامعتبره.');
-        return;
-    }
-    if (ADMIN_IDS.includes(newId)) {
-        tgBot.sendMessage(msg.from.id, '⚠️ این آی‌دی از قبل دسترسی داره.');
-        return;
-    }
-    ADMIN_IDS.push(newId);
-    tgBot.sendMessage(msg.from.id, `✅ دسترسی اضافه شد!\nآی‌دی: ${newId}\n\nتعداد کل ادمین‌ها: ${ADMIN_IDS.length}`);
+    const id = parseInt(match[1]);
+    if (isNaN(id)) return tgBot.sendMessage(msg.from.id, '❌ نامعتبر');
+    if (ADMIN_IDS.includes(id)) return tgBot.sendMessage(msg.from.id, '⚠️ از قبل داره.');
+    ADMIN_IDS.push(id);
+    tgBot.sendMessage(msg.from.id, `✅ اضافه شد: ${id}`);
 });
 
-// /removeaccess
-tgBot.onText(/\/removeaccess (.+)/, (msg, match) => {
-    if (!isAdmin(msg.from.id)) return;
-    const removeId = parseInt(match[1]);
-    if (removeId === 6138410965) {
-        tgBot.sendMessage(msg.from.id, '❌ نمی‌تونی آی‌دی اصلی رو حذف کنی.');
-        return;
-    }
-    const idx = ADMIN_IDS.indexOf(removeId);
-    if (idx === -1) {
-        tgBot.sendMessage(msg.from.id, '❌ این آی‌دی دسترسی نداره.');
-        return;
-    }
-    ADMIN_IDS.splice(idx, 1);
-    tgBot.sendMessage(msg.from.id, `✅ دسترسی حذف شد!\nآی‌دی: ${removeId}`);
-});
-
-// /accesslist
 tgBot.onText(/\/accesslist/, (msg) => {
     if (!isAdmin(msg.from.id)) return;
-    let list = '👥 لیست دسترسی‌ها:\n\n';
-    ADMIN_IDS.forEach((id, i) => {
-        list += `${i+1}. ${id}${id === 6138410965 ? ' (مالک اصلی)' : ''}\n`;
-    });
-    tgBot.sendMessage(msg.from.id, list);
+    const list = ADMIN_IDS.map((id, i) => `${i+1}. ${id}${id === 6138410965 ? ' (مالک)' : ''}`).join('\n');
+    tgBot.sendMessage(msg.from.id, `👥 دسترسی‌ها:\n${list}`);
 });
 
-// Handle Excel file upload
+// Handle Excel
 tgBot.on('document', async (msg) => {
     if (!isAdmin(msg.from.id)) return;
-
-    const fileId = msg.document.file_id;
     const fileName = msg.document.file_name;
-
-    if (!fileName.endsWith('.xlsx') && !fileName.endsWith('.xls') && !fileName.endsWith('.csv')) {
-        tgBot.sendMessage(msg.from.id, '❌ فقط فایل اکسل (xlsx) یا CSV بفرست.');
-        return;
+    if (!fileName.match(/\.(xlsx|xls|csv)$/i)) {
+        return tgBot.sendMessage(msg.from.id, '❌ فقط اکسل یا CSV.');
     }
 
     try {
-        const file = await tgBot.getFile(fileId);
-        const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${file.file_path}`;
-        const response = await fetch(fileUrl);
-        const buffer = await response.arrayBuffer();
+        const file = await tgBot.getFile(msg.document.file_id);
+        const url = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${file.file_path}`;
+        const res = await fetch(url);
+        const buf = await res.arrayBuffer();
 
-        const workbook = XLSX.read(Buffer.from(buffer));
-        const sheetName = workbook.SheetNames[0];
-        const sheet = workbook.Sheets[sheetName];
-        const data = XLSX.utils.sheet_to_json(sheet);
+        const wb = XLSX.read(Buffer.from(buf));
+        const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
 
-        contacts = [];
-        data.forEach(row => {
-            const phone = row['شماره'] || row['phone'] || row['Phone'] || row['شماره تلفن'] || row['شماره_تلفن'] || Object.values(row)[0];
-            const name = row['اسم'] || row['name'] || row['Name'] || row['نام'] || row['نام_خانوادگی'] || Object.values(row)[1] || '';
-
-            if (phone) {
-                contacts.push({
-                    number: String(phone).trim(),
-                    name: String(name).trim()
-                });
-            }
-        });
+        contacts = data.map(row => ({
+            number: String(row['شماره'] || row['phone'] || row['Phone'] || Object.values(row)[0] || '').trim(),
+            name: String(row['اسم'] || row['name'] || row['Name'] || row['نام'] || Object.values(row)[1] || '').trim()
+        })).filter(c => c.number);
 
         fs.writeFileSync('./contacts.json', JSON.stringify(contacts, null, 2));
 
-        let list = `✅ فایل آپلود شد!\n📋 تعداد شماره‌ها: ${contacts.length}\n\n`;
-        contacts.slice(0, 10).forEach((c, i) => {
-            list += `${i+1}. ${c.number} - ${c.name || 'بدون اسم'}\n`;
-        });
-        if (contacts.length > 10) {
-            list += `\n... و ${contacts.length - 10} شماره دیگر`;
-        }
-
+        let list = `✅ ${contacts.length} شماره آپلود شد:\n\n`;
+        contacts.slice(0, 10).forEach((c, i) => list += `${i+1}. ${c.number} - ${c.name || '-'}\n`);
+        if (contacts.length > 10) list += `... +${contacts.length - 10}`;
         tgBot.sendMessage(msg.from.id, list);
     } catch (err) {
-        tgBot.sendMessage(msg.from.id, `❌ خطا در خواندن فایل:\n${err.message}`);
+        tgBot.sendMessage(msg.from.id, `❌ خطا: ${err.message}`);
     }
 });
 
 // ============ STARTUP ============
 async function main() {
-    console.log('🚀 Starting WhatsApp Sender Bot...');
+    console.log('🚀 Starting...');
 
     if (fs.existsSync('./contacts.json')) {
         contacts = JSON.parse(fs.readFileSync('./contacts.json', 'utf8'));
-        console.log(`📋 Loaded ${contacts.length} contacts`);
+        console.log(`📋 ${contacts.length} contacts loaded`);
     }
 
     await connectWhatsApp();
 
-    console.log('✅ Bot is ready!');
-    sendToAdmin('🤖 ربات واتساپ آماده شد!\n\nبرای شروع:\n1. /settings بزن تا QR کد بیاد\n2. اسکن کن\n3. فایل اکسل بفرست\n4. /send متن پیام بزن');
+    sendToAdmin(
+        '🤖 ربات آماده شد!\n\n' +
+        '۱. /settings بزن تا QR بیاد\n' +
+        '۲. اسکن کن\n' +
+        '۳. فایل اکسل بفرست\n' +
+        '۴. /send سلام {name} 👋 ...'
+    );
 }
 
-main().catch(console.error);
+main().catch(err => {
+    console.error('💀 Fatal:', err);
+    process.exit(1);
+});
