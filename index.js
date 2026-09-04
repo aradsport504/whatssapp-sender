@@ -101,9 +101,7 @@ function getTomorrow8am() { const t = new Date(); t.setDate(t.getDate() + 1); t.
 
 async function sendOneMessage(contact, tpl) {
     let msg = tpl.replace(/{name}/g, contact.name || '')
-                 .replace(/{lastname}/g, contact.lastname || '')
-                 .replace(/{code}/g, contact.code || '')
-                 .replace(/{کد اشتراک}/g, contact.code || '');
+                 .replace(/{lastname}/g, contact.lastname || '');
     const num = normNum(contact.number);
     try {
         const [r] = await sock.onWhatsApp(num + '@s.whatsapp.net');
@@ -264,14 +262,14 @@ tg.on('message', (m) => {
     if (st.step === 'template') {
         st.template = text;
         st.step = 'range';
-        tg.sendMessage(m.from.id, `📝 متن: ${text}\n\n📏 محدوده رو بفرست:\n• رنج سطر: ۱۰۰-۲۰۰\n• لیست سطر: ۱۱۱, ۲۵۰, ۳۴۵\n• کد اشتراک: 4521, 7830`);
+        tg.sendMessage(m.from.id, `📝 متن: ${text}\n\n🔢 کد اشتراک رو بفرست:\n• بازه: ۱-۶۰۰۰\n• لیست: 4521, 7830`);
         return;
     }
     if (st.step === 'range') {
         delete convState[m.from.id];
         sendQueue = parseRange(text);
-        if (!sendQueue.length) return tg.sendMessage(m.from.id, '❌ هیچ شماره‌ای پیدا نشد.');
-        const preview = st.template.replace(/{name}/g, 'نام‌مشتری').replace(/{code}/g, 'کد‌اشتراک');
+        if (!sendQueue.length) return tg.sendMessage(m.from.id, '❌ هیچ کد اشتراکی پیدا نشد. فقط کد اشتراک بفرست.');
+        const preview = st.template.replace(/{name}/g, 'نام‌مشتری');
         const sample = sendQueue.slice(0, 3).map((c, i) => `${i + 1}. ${dispNum(c.number)}${c.code ? ` (اشتراک: ${c.code})` : ''} - ${c.name || '—'}`).join('\n');
         tg.sendMessage(m.from.id,
             `📋 پیش‌نمایش:\n📝 ${preview}\n\n👥 ${sendQueue.length} نفر:\n${sample}${sendQueue.length > 3 ? `\n... +${sendQueue.length - 3}` : ''}\n\n✅ تأیید؟ (بله/خیر)`);
@@ -315,46 +313,33 @@ function codeNum(c) {
     return isNaN(n) ? NaN : n;
 }
 function parseRange(text) {
+    // محدوده فقط و فقط کد اشتراک — هیچ مقدار دیگه‌ای قبول نیست
     const t = faToEn(text);
-    // بازه: اول سعی کن کد اشتراک باشه (مثلاً 1-6000 یا 100-200)
+    const toNum = (s) => Number(String(s || '').replace(/[^0-9]/g, ''));
+    // بازه کد: مثلاً 1-6000
     if (t.includes('-')) {
         const [aStr, bStr] = t.split('-').map(s => s.trim());
-        const a = Number((aStr || '').replace(/[^0-9]/g, ''));
-        const b = Number((bStr || '').replace(/[^0-9]/g, ''));
+        const a = toNum(aStr), b = toNum(bStr);
         if (!isNaN(a) && !isNaN(b)) {
             const lo = Math.min(a, b), hi = Math.max(a, b);
-            const byCode = contacts.filter(c => {
+            return contacts.filter(c => {
                 const n = codeNum(c);
                 return !isNaN(n) && n >= lo && n <= hi;
             });
-            // اگه هر دو طرف بازه واقعاً کد اشتراک موجود بودن → انتخاب بر اساس کد
-            if (contacts.some(c => codeNum(c) === a) && contacts.some(c => codeNum(c) === b)) return byCode;
-            if (byCode.length && contacts.some(c => !isNaN(codeNum(c)))) return byCode;
-            // وگرنه: بازه سطری (رفتار قبلی)
-            const ai = parseInt(aStr), bi = parseInt(bStr);
-            if (!isNaN(ai) && !isNaN(bi) && ai <= bi) return contacts.slice(ai - 1, bi);
-            return [];
         }
+        return [];
     }
+    // لیست کد: مثلاً 4521, 7830
     const parts = t.split(/[,،\s]+/).map(s => s.trim()).filter(Boolean);
     if (!parts.length) return [];
-    // اول: تطبیق با کد اشتراک (مقایسه عددی — 007 با 7 یکیه، فارسی با انگلیسی یکیه)
-    const byCode = [];
+    const found = [];
     parts.forEach(p => {
-        const pn = Number(p.replace(/[^0-9]/g, ''));
+        const pn = toNum(p);
         if (isNaN(pn)) return;
         const hit = contacts.find(c => codeNum(c) === pn);
-        if (hit && !byCode.includes(hit)) byCode.push(hit);
+        if (hit && !found.includes(hit)) found.push(hit);
     });
-    if (byCode.length) return byCode;
-    // بعد: شماره سطر (111, 250, 345)
-    const nums = parts.map(s => parseInt(s)).filter(n => !isNaN(n));
-    if (nums.length) {
-        const found = [];
-        nums.forEach(n => { if (contacts[n - 1]) found.push(contacts[n - 1]); });
-        return found;
-    }
-    return [];
+    return found;
 }
 
 // ============ COMMANDS ============
@@ -426,8 +411,7 @@ tg.onText(/\/send/, (m) => {
     tg.sendMessage(m.from.id,
         '📝 متن پیام رو بنویس.\n\n' +
         'برای اسم: `{name}`\n' +
-        'برای کد اشتراک: `{code}`\n' +
-        'مثال: سلام {name} عزیز، کد اشتراک شما {code} است!');
+        'مثال: سلام {name} عزیز، تخفیف ویژه داریم!');
 });
 
 // /resume — restores the SAVED queue (same range), not the whole contacts list
