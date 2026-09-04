@@ -78,11 +78,17 @@ function restartWA(msg) {
 }
 
 // ============ SMART SEND ============
+function faToEn(s) {
+    return String(s || '')
+        .replace(/[۰-۹]/g, d => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d))
+        .replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d));
+}
 function normNum(raw) {
-    let d = String(raw || '').replace(/[^0-9]/g, '');
+    let d = faToEn(raw).replace(/[^0-9]/g, '');
     if (d.startsWith('0098')) d = d.slice(2);
     else if (d.startsWith('98')) d = d;                    // 98912... (already intl)
     else if (d.startsWith('0')) d = '98' + d.slice(1);     // 0912... → 98912...
+    else if (d.length === 10 && d.startsWith('9')) d = '98' + d;  // صفر اول تو اکسل افتاده
     return d;
 }
 function dispNum(intl) {
@@ -101,10 +107,15 @@ async function sendOneMessage(contact, tpl) {
     const num = normNum(contact.number);
     try {
         const [r] = await sock.onWhatsApp(num + '@s.whatsapp.net');
-        if (!r.exists) return { ok: false };
+        if (!r || !r.exists) return { ok: false, reason: 'no-wa' };
         await sock.sendMessage(num + '@s.whatsapp.net', { text: msg });
         return { ok: true };
-    } catch { return { ok: false }; }
+    } catch (e) {
+        const msgErr = String(e?.message || e);
+        if (/rate|limit|429|too many|flood|blocked|banned|ban/i.test(msgErr)) return { ok: false, reason: 'limited', error: msgErr };
+        if (!waReady || !sock) return { ok: false, reason: 'down', error: msgErr };
+        return { ok: false, reason: 'error', error: msgErr };
+    }
 }
 
 async function smartSend(template) {
@@ -121,7 +132,7 @@ async function smartSend(template) {
         if (startIdx > 0) tell(`📊 ادامه از ${startIdx + 1}`);
     }
 
-    let sent = 0, failed = 0;
+    let sent = 0, skippedNoWa = 0, failed = 0;
     const total = sendQueue.length;
     tell(`🚀 شروع!\n📱 ${total} پیام\n⏰ ۸ صبح تا ۱۱ شب\n🔄 فاصله: ۹۰-۹۰۰ ثانیه رندوم`);
 
@@ -130,22 +141,31 @@ async function smartSend(template) {
         if (!isAllowedTime()) {
             sending = false;
             const waitMs = getTomorrow8am() - new Date();
-            tell(`⏸️ ۱۱ شب شد!\n📅 فردا ۸ صبح ادامه\n📊 ✅${sent} ❌${failed} | باقی: ${sendQueue.length - i}`);
+            tell(`⏸️ ۱۱ شب شد!\n📅 فردا ۸ صبح ادامه\n📊 ✅${sent} ⏭️${skippedNoWa} ❌${failed} | باقی: ${sendQueue.length - i}`);
             saveProgress(sendQueue, i, template);
             sendResumeTimer = setTimeout(() => { tell('☀️ صبح بخیر! ادامه...'); sendQueue = sendQueue.slice(i); smartSend(template); }, waitMs);
             return;
         }
-        const num = normNum(sendQueue[i].number);
         const result = await sendOneMessage(sendQueue[i], template);
-        result.ok ? sent++ : failed++;
-        if ((sent + failed) % 10 === 0) tell(`📊 ${sent + failed}/${total} ✅${sent} ❌${failed}`);
+        if (result.ok) sent++;
+        else if (result.reason === 'no-wa') skippedNoWa++;   // واتساپ نداره → رد شو، ادامه بده
+        else if (result.reason === 'limited' || result.reason === 'down') {
+            // لیمیت واتساپ یا قطع اتصال → وایسا، پیشرفت ذخیره‌ست، با /resume ادامه بده
+            sending = false;
+            saveProgress(sendQueue, i, template);
+            tell(`⛔ ${result.reason === 'limited' ? 'واتساپ لیمیت داد! فعلاً وایسادم.' : 'اتصال واتساپ قطع شد!'}\n📊 ✅${sent} ⏭️${skippedNoWa} ❌${failed} | باقی: ${sendQueue.length - i}\n🔄 بعداً با /resume ادامه بده.`);
+            return;
+        }
+        else failed++;
+        const done = sent + skippedNoWa + failed;
+        if (done % 10 === 0) tell(`📊 ${done}/${total} ✅${sent} ⏭️${skippedNoWa} ❌${failed}`);
         saveProgress(sendQueue, i + 1, template);
         if (i < sendQueue.length - 1) await new Promise(r => setTimeout(r, randomBetween(90, 900) * 1000));
     }
 
     sending = false; sendQueue = [];
     try { fs.unlinkSync('./send_progress.json'); } catch(e) {}
-    tell(`✅ تمام شد!\n📊 ✅${sent} ❌${failed} از ${total}`);
+    tell(`✅ تمام شد!\n📊 ✅${sent} ⏭️${skippedNoWa} (بدون واتساپ) ❌${failed} از ${total}`);
 }
 
 function saveProgress(queue, sent, template) {
@@ -165,6 +185,7 @@ tg.on('document', async (m) => {
         const buf = await res.arrayBuffer();
         const wb = XLSX.read(Buffer.from(buf));
         const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+        let skipped = 0;
         contacts = data.map(r => {
             const first = String(r['نام'] || r['اسم'] || r['name'] || r['نام مشتری'] || Object.values(r)[1] || '').trim();
             const last = String(r['نام خانوادگی'] || r['نام‌خانوادگی'] || r['lastname'] || r['family'] || '').trim();
@@ -172,13 +193,17 @@ tg.on('document', async (m) => {
                 number: normNum(String(r['شماره'] || r['phone'] || r['موبایل'] || Object.values(r)[0] || '').trim()),
                 name: [first, last].filter(Boolean).join(' '),
                 lastname: last,
-                code: String(r['کد اشتراک'] || r['کد'] || r['code'] || r['اشتراک'] || '').trim()
+                code: faToEn(String(r['کد اشتراک'] || r['کد'] || r['code'] || r['اشتراک'] || '')).trim()
             };
-        }).filter(c => c.number && c.number.length >= 10);
+        }).filter(c => {
+            if (c.number && c.number.length >= 10) return true;
+            skipped++;
+            return false;
+        });
         fs.writeFileSync('./contacts.json', JSON.stringify(contacts, null, 2));
         const sample = contacts.slice(0, 5).map((c, i) => `${i + 1}. ${dispNum(c.number)}${c.code ? ` (اشتراک: ${c.code})` : ''} - ${c.name || '—'}`).join('\n');
         tg.sendMessage(m.from.id,
-            `✅ ${contacts.length} شماره ذخیره شد!\n\n${sample}${contacts.length > 5 ? `\n... +${contacts.length - 5}` : ''}\n\n/upload مجدد برای آپلود جدید`);
+            `✅ ${contacts.length} شماره ذخیره شد!${skipped ? `\n⚠️ ${skipped} سطر شماره نامعتبر داشت و رد شد.` : ''}\n\n${sample}${contacts.length > 5 ? `\n... +${contacts.length - 5}` : ''}\n\n/upload مجدد برای آپلود جدید`);
     } catch (e) { tg.sendMessage(m.from.id, `❌ ${e.message}`); }
 });
 
