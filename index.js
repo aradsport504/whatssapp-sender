@@ -101,7 +101,10 @@ function getTomorrow8am() { const t = new Date(); t.setDate(t.getDate() + 1); t.
 
 async function sendOneMessage(contact, tpl) {
     let msg = tpl.replace(/{name}/g, contact.name || '')
-                 .replace(/{lastname}/g, contact.lastname || '');
+                 .replace(/{نام}/g, contact.name || '')
+                 .replace(/{lastname}/g, contact.lastname || '')
+                 .replace(/{نام خانوادگی}/g, contact.lastname || '')
+                 .replace(/{نام‌خانوادگی}/g, contact.lastname || '');
     const num = normNum(contact.number);
     try {
         const [r] = await sock.onWhatsApp(num + '@s.whatsapp.net');
@@ -299,9 +302,14 @@ tg.on('message', (m) => {
         delete convState[m.from.id];
         if (!waReady || !sock) return tg.sendMessage(m.from.id, '⚠️ واتساپ وصل نیست!');
         const jid = st.number + '@s.whatsapp.net';
+        // اگه این شماره تو مخاطبین باشه، اسمش رو جایگذاری کن
+        const known = contacts.find(c => normNum(c.number) === st.number);
+        const finalText = text.replace(/{name}/g, known?.name || '').replace(/{نام}/g, known?.name || '')
+            .replace(/{lastname}/g, known?.lastname || '').replace(/{نام خانوادگی}/g, known?.lastname || '')
+            .replace(/{نام‌خانوادگی}/g, known?.lastname || '');
         sock.onWhatsApp(jid).then(([r]) => {
             if (!r.exists) return tg.sendMessage(m.from.id, `❌ ${st.number} واتساپ نداره`);
-            return sock.sendMessage(jid, { text });
+            return sock.sendMessage(jid, { text: finalText });
         }).then(() => tg.sendMessage(m.from.id, `✅ فرستاده شد! 📞 ${st.number}`))
           .catch(e => tg.sendMessage(m.from.id, `❌ ${e.message}`));
     }
