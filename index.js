@@ -6,9 +6,15 @@ const http = require('http');
 const pino = require('pino');
 const QR = require('qrcode');
 
-const TG_TOKEN = process.env.TELEGRAM_TOKEN || '8902204232:AAEw0N7UR1amMKO9xuGV8KkHyS-kym7sCmk';
-const ADMINS = (process.env.ADMIN_IDS || '6138410965').split(',').map(Number);
-const MY_NUMBER = process.env.MY_NUMBER || '';
+const TG_TOKEN = process.env.TELEGRAM_TOKEN || '';
+if (!TG_TOKEN) { console.error('❌ TELEGRAM_TOKEN env missing!'); process.exit(1); }
+let ADMINS = (process.env.ADMIN_IDS || '6138410965').split(',').map(Number);
+try {
+    if (fs.existsSync('./access.json')) {
+        const extra = JSON.parse(fs.readFileSync('./access.json', 'utf8'));
+        if (Array.isArray(extra)) ADMINS = [...new Set([...ADMINS, ...extra])];
+    }
+} catch(e) {}
 const AUTH_DIR = './auth_info';
 
 http.createServer((_, res) => { res.writeHead(200); res.end('OK'); }).listen(process.env.PORT || 3000);
@@ -94,12 +100,11 @@ async function smartSend(template) {
     sending = true;
 
     let startIdx = 0;
-    const pf = './send_progress.json';
-    if (fs.existsSync(pf)) {
-        try {
-            const sv = JSON.parse(fs.readFileSync(pf, 'utf8'));
-            if (sv.queueKey === sendProgressKey()) { startIdx = sv.sent; tell(`📊 ادامه از ${startIdx + 1}`); }
-        } catch(e) {}
+    const sv0 = loadProgress();
+    if (sv0 && Array.isArray(sv0.queue) && sv0.queue.length === sendQueue.length &&
+        sv0.queue.every((c, j) => c.number === sendQueue[j].number)) {
+        startIdx = sv0.sent || 0;
+        if (startIdx > 0) tell(`📊 ادامه از ${startIdx + 1}`);
     }
 
     let sent = 0, failed = 0;
@@ -112,7 +117,7 @@ async function smartSend(template) {
             sending = false;
             const waitMs = getTomorrow8am() - new Date();
             tell(`⏸️ ۱۱ شب شد!\n📅 فردا ۸ صبح ادامه\n📊 ✅${sent} ❌${failed} | باقی: ${sendQueue.length - i}`);
-            fs.writeFileSync(pf, JSON.stringify({ queueKey: sendProgressKey(), sent: i, messageTemplate: template, ts: new Date().toISOString() }));
+            saveProgress(sendQueue, i, template);
             sendResumeTimer = setTimeout(() => { tell('☀️ صبح بخیر! ادامه...'); sendQueue = sendQueue.slice(i); smartSend(template); }, waitMs);
             return;
         }
@@ -120,16 +125,21 @@ async function smartSend(template) {
         const result = await sendOneMessage(sendQueue[i], template);
         result.ok ? sent++ : failed++;
         if ((sent + failed) % 10 === 0) tell(`📊 ${sent + failed}/${total} ✅${sent} ❌${failed}`);
-        fs.writeFileSync(pf, JSON.stringify({ queueKey: sendProgressKey(), sent: i + 1, messageTemplate: template, ts: new Date().toISOString() }));
+        saveProgress(sendQueue, i + 1, template);
         if (i < sendQueue.length - 1) await new Promise(r => setTimeout(r, randomBetween(90, 900) * 1000));
     }
 
     sending = false; sendQueue = [];
-    try { fs.unlinkSync(pf); } catch(e) {}
+    try { fs.unlinkSync('./send_progress.json'); } catch(e) {}
     tell(`✅ تمام شد!\n📊 ✅${sent} ❌${failed} از ${total}`);
 }
 
-function sendProgressKey() { return sendQueue.map(c => c.number).join(',').slice(0, 200); }
+function saveProgress(queue, sent, template) {
+    try { fs.writeFileSync('./send_progress.json', JSON.stringify({ queue, sent, messageTemplate: template, ts: new Date().toISOString() })); } catch(e) {}
+}
+function loadProgress() {
+    try { return JSON.parse(fs.readFileSync('./send_progress.json', 'utf8')); } catch(e) { return null; }
+}
 
 // ============ DOCUMENT HANDLER ============
 tg.on('document', async (m) => {
@@ -241,6 +251,7 @@ tg.onText(/\/start/, (m) => {
         '/status - وضعیت\n' +
         '/stop - توقف\n' +
         '/contacts - لیست شماره‌ها\n' +
+        '/accesslist - لیست ادمین‌ها\n' +
         '/limit - لیمیت‌ها');
 });
 
@@ -261,20 +272,27 @@ tg.onText(/\/clear/, (m) => {
 // /qr
 tg.onText(/\/qr/, (m) => { if (isAdmin(m.from.id)) restartWA('🔄 ریستارت برای QR...'); });
 
-// /pair
+// /pair — pairing code must be requested WHILE connecting, not after open
+let pairTimer = null;
 tg.onText(/\/pair/, (m) => {
     if (!isAdmin(m.from.id)) return;
+    if (!MY_NUMBER) return tg.sendMessage(m.from.id, '⚠️ MY_NUMBER نیست! اول وریبل MY_NUMBER رو تنظیم کن.');
     restartWA('🔄 ریستارت برای Pairing...');
-    const iv = setInterval(() => {
-        if (waReady && sock) {
-            clearInterval(iv);
-            if (!MY_NUMBER) return tell('⚠️ MY_NUMBER نیست!');
-            sock.requestPairingCode(MY_NUMBER).then(code => {
+    if (pairTimer) { clearInterval(pairTimer); pairTimer = null; }
+    let tries = 0;
+    pairTimer = setInterval(async () => {
+        tries++;
+        if (waReady) { clearInterval(pairTimer); pairTimer = null; return; }
+        if (sock && !waReady) {
+            try {
+                const code = await sock.requestPairingCode(MY_NUMBER);
+                clearInterval(pairTimer); pairTimer = null;
                 tell(`🔑 کد Pairing:\n\n*${code}*\n\n📞 واتساپ → Linked Devices → Link with Phone Number`, { parse_mode: 'Markdown' });
-            }).catch(e => tell('❌ ' + e.message));
+                return;
+            } catch(e) { /* socket not ready yet, retry */ }
         }
+        if (tries >= 30) { clearInterval(pairTimer); pairTimer = null; tell('❌ Pairing timeout شد. دوباره /pair بزن.'); }
     }, 1000);
-    setTimeout(() => clearInterval(iv), 30000);
 });
 
 // /send → مرحله‌ای: متن → محدوده → تأیید
@@ -289,12 +307,12 @@ tg.onText(/\/send/, (m) => {
         'مثال: سلام {name} عزیز، تخفیف ویژه داریم!');
 });
 
-// /resume
+// /resume — restores the SAVED queue (same range), not the whole contacts list
 tg.onText(/\/resume/, (m) => {
     if (!isAdmin(m.from.id)) return;
-    if (!fs.existsSync('./send_progress.json')) return tg.sendMessage(m.from.id, '❌ ارسال قبلی نیست.');
-    const sv = JSON.parse(fs.readFileSync('./send_progress.json', 'utf8'));
-    sendQueue = contacts.slice();
+    const sv = loadProgress();
+    if (!sv || !Array.isArray(sv.queue) || !sv.queue.length) return tg.sendMessage(m.from.id, '❌ ارسال قبلی نیست.');
+    sendQueue = sv.queue;
     tell(`🔄 ادامه از ${sv.sent + 1}...`);
     smartSend(sv.messageTemplate);
 });
@@ -318,9 +336,9 @@ tg.onText(/\/status/, (m) => {
     if (!isAdmin(m.from.id)) return;
     let s = `📱 واتساپ: ${waReady ? '✅' : '❌'}\n📋 اکسل: ${contacts.length} شماره`;
     if (sending) s += `\n🔄 در حال ارسال...`;
-    if (fs.existsSync('./send_progress.json')) {
-        const sv = JSON.parse(fs.readFileSync('./send_progress.json', 'utf8'));
-        s += `\n⏸️ ناقص: از ${sv.sent + 1}`;
+    const sv = loadProgress();
+    if (sv && sv.queue) {
+        s += `\n⏸️ ناقص: از ${sv.sent + 1} (از ${sv.queue.length} نفر)`;
     }
     tg.sendMessage(m.from.id, s);
 });
@@ -338,6 +356,25 @@ tg.onText(/\/contacts/, (m) => {
     let l = contacts.slice(0, 20).map((c, i) => `${i + 1}. ${c.number} - ${c.name || '—'}`).join('\n');
     if (contacts.length > 20) l += `\n... +${contacts.length - 20}`;
     tg.sendMessage(m.from.id, `📋 (${contacts.length}):\n${l}`);
+});
+
+// /accesslist + /addaccess (persisted in access.json)
+tg.onText(/\/accesslist/, (m) => {
+    if (!isAdmin(m.from.id)) return;
+    tg.sendMessage(m.from.id, `👥 ادمین‌ها:\n${ADMINS.map((a, i) => `${i + 1}. ${a}`).join('\n')}`);
+});
+
+tg.onText(/\/addaccess (.+)/, (m, match) => {
+    if (!isAdmin(m.from.id)) return;
+    const id = parseInt(match[1].trim());
+    if (isNaN(id)) return tg.sendMessage(m.from.id, '❌ آیدی نامعتبر. مثال: /addaccess 123456789');
+    if (ADMINS.includes(id)) return tg.sendMessage(m.from.id, 'ℹ️ این آیدی قبلاً ادمینه.');
+    ADMINS.push(id);
+    try {
+        const base = (process.env.ADMIN_IDS || '6138410965').split(',').map(Number);
+        fs.writeFileSync('./access.json', JSON.stringify(ADMINS.filter(a => !base.includes(a))));
+    } catch(e) { return tg.sendMessage(m.from.id, '❌ ذخیره نشد: ' + e.message); }
+    tg.sendMessage(m.from.id, `✅ ${id} ادمین شد.`);
 });
 
 tg.onText(/\/limit/, (m) => {
