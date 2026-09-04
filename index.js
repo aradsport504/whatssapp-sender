@@ -272,19 +272,42 @@ tg.on('message', (m) => {
     }
 });
 
+function codeNum(c) {
+    if (!c || !c.code) return NaN;
+    const n = Number(faToEn(c.code).replace(/[^0-9]/g, ''));
+    return isNaN(n) ? NaN : n;
+}
 function parseRange(text) {
-    // رنج سطری: 100-200
-    if (text.includes('-')) {
-        const [a, b] = text.split('-').map(s => parseInt(s.trim()));
-        if (!isNaN(a) && !isNaN(b) && a <= b) return contacts.slice(a - 1, b);
+    const t = faToEn(text);
+    // بازه: اول سعی کن کد اشتراک باشه (مثلاً 1-6000 یا 100-200)
+    if (t.includes('-')) {
+        const [aStr, bStr] = t.split('-').map(s => s.trim());
+        const a = Number((aStr || '').replace(/[^0-9]/g, ''));
+        const b = Number((bStr || '').replace(/[^0-9]/g, ''));
+        if (!isNaN(a) && !isNaN(b)) {
+            const lo = Math.min(a, b), hi = Math.max(a, b);
+            const byCode = contacts.filter(c => {
+                const n = codeNum(c);
+                return !isNaN(n) && n >= lo && n <= hi;
+            });
+            // اگه هر دو طرف بازه واقعاً کد اشتراک موجود بودن → انتخاب بر اساس کد
+            if (contacts.some(c => codeNum(c) === a) && contacts.some(c => codeNum(c) === b)) return byCode;
+            if (byCode.length && contacts.some(c => !isNaN(codeNum(c)))) return byCode;
+            // وگرنه: بازه سطری (رفتار قبلی)
+            const ai = parseInt(aStr), bi = parseInt(bStr);
+            if (!isNaN(ai) && !isNaN(bi) && ai <= bi) return contacts.slice(ai - 1, bi);
+            return [];
+        }
     }
-    const parts = text.split(/[,،\s]+/).map(s => s.trim()).filter(Boolean);
+    const parts = t.split(/[,،\s]+/).map(s => s.trim()).filter(Boolean);
     if (!parts.length) return [];
-    // اول: تطبیق با کد اشتراک
+    // اول: تطبیق با کد اشتراک (مقایسه عددی — 007 با 7 یکیه، فارسی با انگلیسی یکیه)
     const byCode = [];
     parts.forEach(p => {
-        const hit = contacts.find(c => c.code && c.code === p);
-        if (hit) byCode.push(hit);
+        const pn = Number(p.replace(/[^0-9]/g, ''));
+        if (isNaN(pn)) return;
+        const hit = contacts.find(c => codeNum(c) === pn);
+        if (hit && !byCode.includes(hit)) byCode.push(hit);
     });
     if (byCode.length) return byCode;
     // بعد: شماره سطر (111, 250, 345)
