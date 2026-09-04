@@ -165,11 +165,16 @@ tg.on('document', async (m) => {
         const buf = await res.arrayBuffer();
         const wb = XLSX.read(Buffer.from(buf));
         const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
-        contacts = data.map(r => ({
-            number: normNum(String(r['شماره'] || r['phone'] || r['موبایل'] || Object.values(r)[0] || '').trim()),
-            name: String(r['اسم'] || r['name'] || r['نام'] || r['نام مشتری'] || Object.values(r)[1] || '').trim(),
-            code: String(r['کد اشتراک'] || r['کد'] || r['code'] || r['اشتراک'] || '').trim()
-        })).filter(c => c.number && c.number.length >= 10);
+        contacts = data.map(r => {
+            const first = String(r['نام'] || r['اسم'] || r['name'] || r['نام مشتری'] || Object.values(r)[1] || '').trim();
+            const last = String(r['نام خانوادگی'] || r['نام‌خانوادگی'] || r['lastname'] || r['family'] || '').trim();
+            return {
+                number: normNum(String(r['شماره'] || r['phone'] || r['موبایل'] || Object.values(r)[0] || '').trim()),
+                name: [first, last].filter(Boolean).join(' '),
+                lastname: last,
+                code: String(r['کد اشتراک'] || r['کد'] || r['code'] || r['اشتراک'] || '').trim()
+            };
+        }).filter(c => c.number && c.number.length >= 10);
         fs.writeFileSync('./contacts.json', JSON.stringify(contacts, null, 2));
         const sample = contacts.slice(0, 5).map((c, i) => `${i + 1}. ${dispNum(c.number)}${c.code ? ` (اشتراک: ${c.code})` : ''} - ${c.name || '—'}`).join('\n');
         tg.sendMessage(m.from.id,
@@ -282,7 +287,7 @@ tg.onText(/\/start/, (m) => {
 // /upload → فقط آپلود اکسل
 tg.onText(/\/upload/, (m) => {
     if (!isAdmin(m.from.id)) return;
-    tg.sendMessage(m.from.id, '📎 فایل اکسل بفرست.\n\nستون‌ها: شماره (09...), اسم, کد اشتراک');
+    tg.sendMessage(m.from.id, '📎 فایل اکسل بفرست.\n\nستون‌ها: شماره (09...), نام, نام خانوادگی, کد اشتراک');
 });
 
 // /clear → پاک کردن اکسل از حافظه
