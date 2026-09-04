@@ -175,6 +175,38 @@ function loadProgress() {
     try { return JSON.parse(fs.readFileSync('./send_progress.json', 'utf8')); } catch(e) { return null; }
 }
 
+// نرمالایز اسم ستون: فارسی→انگلیسی، حذف فاصله و نیم‌فاصله و حروف نامرئی
+function normHeader(h) {
+    return faToEn(String(h || '')).replace(/[\s\u200c\u200d\u200e\u200f\ufeff_\-\.]+/g, '').toLowerCase();
+}
+const COL_ALIASES = {
+    code: ['کد اشتراک', 'کد', 'اشتراک', 'code', 'subscription', 'subscriptioncode', 'id'],
+    first: ['نام', 'اسم', 'name', 'firstname', 'نام مشتری', 'ناممشتری'],
+    last: ['نام خانوادگی', 'نامخانوادگی', 'lastname', 'family', 'فامیل'],
+    phone: ['شماره', 'شماره تماس', 'شماره موبایل', 'شماره تلفن', 'تلفن', 'موبایل', 'phone', 'mobile', 'phonenumber', 'tel']
+};
+const COL_DEFAULT_POS = ['code', 'first', 'last', 'phone'];  // ترتیب پیش‌فرض ستون‌ها
+function detectColumns(keys) {
+    const norm = keys.map(normHeader);
+    const aliasNorm = {};
+    for (const role in COL_ALIASES) aliasNorm[role] = COL_ALIASES[role].map(normHeader);
+    const assigned = {}, usedRoles = new Set();
+    keys.forEach((k, i) => {
+        for (const role in aliasNorm) {
+            if (!usedRoles.has(role) && aliasNorm[role].includes(norm[i])) {
+                assigned[i] = role; usedRoles.add(role); break;
+            }
+        }
+    });
+    // ستون‌های تشخیص‌داده‌نشده → بر اساس موقعیت پیش‌فرض
+    keys.forEach((k, i) => {
+        if (!assigned[i] && i < COL_DEFAULT_POS.length && !usedRoles.has(COL_DEFAULT_POS[i])) {
+            assigned[i] = COL_DEFAULT_POS[i]; usedRoles.add(COL_DEFAULT_POS[i]);
+        }
+    });
+    return assigned;  // {columnIndex: role}
+}
+
 // ============ DOCUMENT HANDLER ============
 tg.on('document', async (m) => {
     if (!isAdmin(m.from.id)) return;
@@ -184,19 +216,24 @@ tg.on('document', async (m) => {
         const res = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${file.file_path}`);
         const buf = await res.arrayBuffer();
         const wb = XLSX.read(Buffer.from(buf));
-        const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+        const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '' });
         if (!data.length) return tg.sendMessage(m.from.id, '❌ اکسل خالیه یا شیت اول خونده نشد.');
-        const headers = Object.keys(data[0]).join(' | ');
+        const keys = Object.keys(data[0]);
+        const headers = keys.join(' | ');
+        const colMap = detectColumns(keys);  // {index: role}
         let skipped = 0;
         contacts = data.map(r => {
-            const first = String(r['نام'] || r['اسم'] || r['name'] || r['نام مشتری'] || '').trim();
-            const last = String(r['نام خانوادگی'] || r['نام‌خانوادگی'] || r['lastname'] || r['family'] || '').trim();
-            const rawNum = String(r['شماره'] || r['شماره تماس'] || r['شماره موبایل'] || r['شماره تلفن'] || r['تلفن'] || r['موبایل'] || r['phone'] || r['mobile'] || r['phone number'] || '').trim();
+            const vals = keys.map(k => String(r[k] ?? '').trim());
+            const get = (role) => {
+                const idx = Object.keys(colMap).find(i => colMap[i] === role);
+                return idx !== undefined ? vals[Number(idx)] : '';
+            };
+            const first = get('first'), last = get('last');
             return {
-                number: normNum(rawNum),
+                number: normNum(get('phone')),
                 name: [first, last].filter(Boolean).join(' '),
                 lastname: last,
-                code: faToEn(String(r['کد اشتراک'] || r['کد'] || r['code'] || r['اشتراک'] || '')).trim()
+                code: faToEn(get('code')).trim()
             };
         }).filter(c => {
             if (c.number && c.number.length >= 10) return true;
