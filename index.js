@@ -185,12 +185,15 @@ tg.on('document', async (m) => {
         const buf = await res.arrayBuffer();
         const wb = XLSX.read(Buffer.from(buf));
         const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+        if (!data.length) return tg.sendMessage(m.from.id, '❌ اکسل خالیه یا شیت اول خونده نشد.');
+        const headers = Object.keys(data[0]).join(' | ');
         let skipped = 0;
         contacts = data.map(r => {
-            const first = String(r['نام'] || r['اسم'] || r['name'] || r['نام مشتری'] || Object.values(r)[1] || '').trim();
+            const first = String(r['نام'] || r['اسم'] || r['name'] || r['نام مشتری'] || '').trim();
             const last = String(r['نام خانوادگی'] || r['نام‌خانوادگی'] || r['lastname'] || r['family'] || '').trim();
+            const rawNum = String(r['شماره'] || r['شماره تماس'] || r['شماره موبایل'] || r['شماره تلفن'] || r['تلفن'] || r['موبایل'] || r['phone'] || r['mobile'] || r['phone number'] || '').trim();
             return {
-                number: normNum(String(r['شماره'] || r['phone'] || r['موبایل'] || Object.values(r)[0] || '').trim()),
+                number: normNum(rawNum),
                 name: [first, last].filter(Boolean).join(' '),
                 lastname: last,
                 code: faToEn(String(r['کد اشتراک'] || r['کد'] || r['code'] || r['اشتراک'] || '')).trim()
@@ -201,6 +204,11 @@ tg.on('document', async (m) => {
             return false;
         });
         fs.writeFileSync('./contacts.json', JSON.stringify(contacts, null, 2));
+        if (!contacts.length) {
+            const firstRow = JSON.stringify(data[0], null, 0).slice(0, 500);
+            return tg.sendMessage(m.from.id,
+                `❌ ۰ شماره ذخیره شد!\n\n🔍 ستون‌های پیدا شده:\n${headers}\n\n📄 سطر اول:\n${firstRow}\n\nاسم دقیق ستون شماره رو بفرست تا اضافه‌ش کنم.`);
+        }
         const sample = contacts.slice(0, 5).map((c, i) => `${i + 1}. ${dispNum(c.number)}${c.code ? ` (اشتراک: ${c.code})` : ''} - ${c.name || '—'}`).join('\n');
         tg.sendMessage(m.from.id,
             `✅ ${contacts.length} شماره ذخیره شد!${skipped ? `\n⚠️ ${skipped} سطر شماره نامعتبر داشت و رد شد.` : ''}\n\n${sample}${contacts.length > 5 ? `\n... +${contacts.length - 5}` : ''}\n\n/upload مجدد برای آپلود جدید`);
