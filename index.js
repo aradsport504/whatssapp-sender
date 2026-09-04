@@ -78,13 +78,27 @@ function restartWA(msg) {
 }
 
 // ============ SMART SEND ============
+function normNum(raw) {
+    let d = String(raw || '').replace(/[^0-9]/g, '');
+    if (d.startsWith('0098')) d = d.slice(2);
+    else if (d.startsWith('98')) d = d;                    // 98912... (already intl)
+    else if (d.startsWith('0')) d = '98' + d.slice(1);     // 0912... → 98912...
+    return d;
+}
+function dispNum(intl) {
+    return intl.startsWith('98') ? '0' + intl.slice(2) : intl;  // 98912... → 0912...
+}
+function toJid(raw) { return normNum(raw) + '@s.whatsapp.net'; }
 function randomBetween(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 function isAllowedTime() { return new Date().getHours() >= 8 && new Date().getHours() < 23; }
 function getTomorrow8am() { const t = new Date(); t.setDate(t.getDate() + 1); t.setHours(8, 0, 0, 0); return t; }
 
 async function sendOneMessage(contact, tpl) {
-    let msg = tpl.replace(/{name}/g, contact.name || '').replace(/{lastname}/g, contact.lastname || '');
-    const num = contact.number.replace(/[^0-9]/g, '');
+    let msg = tpl.replace(/{name}/g, contact.name || '')
+                 .replace(/{lastname}/g, contact.lastname || '')
+                 .replace(/{code}/g, contact.code || '')
+                 .replace(/{کد اشتراک}/g, contact.code || '');
+    const num = normNum(contact.number);
     try {
         const [r] = await sock.onWhatsApp(num + '@s.whatsapp.net');
         if (!r.exists) return { ok: false };
@@ -121,7 +135,7 @@ async function smartSend(template) {
             sendResumeTimer = setTimeout(() => { tell('☀️ صبح بخیر! ادامه...'); sendQueue = sendQueue.slice(i); smartSend(template); }, waitMs);
             return;
         }
-        const num = sendQueue[i].number.replace(/[^0-9]/g, '');
+        const num = normNum(sendQueue[i].number);
         const result = await sendOneMessage(sendQueue[i], template);
         result.ok ? sent++ : failed++;
         if ((sent + failed) % 10 === 0) tell(`📊 ${sent + failed}/${total} ✅${sent} ❌${failed}`);
@@ -152,11 +166,12 @@ tg.on('document', async (m) => {
         const wb = XLSX.read(Buffer.from(buf));
         const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
         contacts = data.map(r => ({
-            number: String(r['شماره'] || r['phone'] || Object.values(r)[0] || '').trim(),
-            name: String(r['اسم'] || r['name'] || r['نام'] || Object.values(r)[1] || '').trim()
-        })).filter(c => c.number);
+            number: normNum(String(r['شماره'] || r['phone'] || r['موبایل'] || Object.values(r)[0] || '').trim()),
+            name: String(r['اسم'] || r['name'] || r['نام'] || r['نام مشتری'] || Object.values(r)[1] || '').trim(),
+            code: String(r['کد اشتراک'] || r['کد'] || r['code'] || r['اشتراک'] || '').trim()
+        })).filter(c => c.number && c.number.length >= 10);
         fs.writeFileSync('./contacts.json', JSON.stringify(contacts, null, 2));
-        const sample = contacts.slice(0, 5).map((c, i) => `${i + 1}. ${c.number} - ${c.name || '—'}`).join('\n');
+        const sample = contacts.slice(0, 5).map((c, i) => `${i + 1}. ${dispNum(c.number)}${c.code ? ` (اشتراک: ${c.code})` : ''} - ${c.name || '—'}`).join('\n');
         tg.sendMessage(m.from.id,
             `✅ ${contacts.length} شماره ذخیره شد!\n\n${sample}${contacts.length > 5 ? `\n... +${contacts.length - 5}` : ''}\n\n/upload مجدد برای آپلود جدید`);
     } catch (e) { tg.sendMessage(m.from.id, `❌ ${e.message}`); }
@@ -174,15 +189,15 @@ tg.on('message', (m) => {
     if (st.step === 'template') {
         st.template = text;
         st.step = 'range';
-        tg.sendMessage(m.from.id, `📝 متن: ${text}\n\n📏 محدوده رو بفرست:\n• رنج: ۱۰۰-۲۰۰\n• لیست: ۱۱۱, ۲۵۰, ۳۴۵`);
+        tg.sendMessage(m.from.id, `📝 متن: ${text}\n\n📏 محدوده رو بفرست:\n• رنج سطر: ۱۰۰-۲۰۰\n• لیست سطر: ۱۱۱, ۲۵۰, ۳۴۵\n• کد اشتراک: 4521, 7830`);
         return;
     }
     if (st.step === 'range') {
         delete convState[m.from.id];
         sendQueue = parseRange(text);
         if (!sendQueue.length) return tg.sendMessage(m.from.id, '❌ هیچ شماره‌ای پیدا نشد.');
-        const preview = st.template.replace(/{name}/g, 'نام‌مشتری');
-        const sample = sendQueue.slice(0, 3).map((c, i) => `${i + 1}. ${c.number} - ${c.name || '—'}`).join('\n');
+        const preview = st.template.replace(/{name}/g, 'نام‌مشتری').replace(/{code}/g, 'کد‌اشتراک');
+        const sample = sendQueue.slice(0, 3).map((c, i) => `${i + 1}. ${dispNum(c.number)}${c.code ? ` (اشتراک: ${c.code})` : ''} - ${c.name || '—'}`).join('\n');
         tg.sendMessage(m.from.id,
             `📋 پیش‌نمایش:\n📝 ${preview}\n\n👥 ${sendQueue.length} نفر:\n${sample}${sendQueue.length > 3 ? `\n... +${sendQueue.length - 3}` : ''}\n\n✅ تأیید؟ (بله/خیر)`);
         st.pendingTemplate = st.template;
@@ -201,10 +216,10 @@ tg.on('message', (m) => {
 
     // /test flow
     if (st.step === 'number') {
-        const num = text.replace(/[^0-9]/g, '');
-        if (num.length < 8) return tg.sendMessage(m.from.id, '❌ شماره نامعتبر.');
+        const num = normNum(text);
+        if (num.length < 12) return tg.sendMessage(m.from.id, '❌ شماره نامعتبر.');
         st.number = num; st.step = 'message';
-        tg.sendMessage(m.from.id, `📞 ${num}\n\n📝 پیام رو بنویس:`);
+        tg.sendMessage(m.from.id, `📞 ${dispNum(num)}\n\n📝 پیام رو بنویس:`);
         return;
     }
     if (st.step === 'message') {
@@ -220,13 +235,22 @@ tg.on('message', (m) => {
 });
 
 function parseRange(text) {
-    // رنج: 100-200
+    // رنج سطری: 100-200
     if (text.includes('-')) {
         const [a, b] = text.split('-').map(s => parseInt(s.trim()));
         if (!isNaN(a) && !isNaN(b) && a <= b) return contacts.slice(a - 1, b);
     }
-    // لیست: 111, 250, 345
-    const nums = text.split(/[,،\s]+/).map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+    const parts = text.split(/[,،\s]+/).map(s => s.trim()).filter(Boolean);
+    if (!parts.length) return [];
+    // اول: تطبیق با کد اشتراک
+    const byCode = [];
+    parts.forEach(p => {
+        const hit = contacts.find(c => c.code && c.code === p);
+        if (hit) byCode.push(hit);
+    });
+    if (byCode.length) return byCode;
+    // بعد: شماره سطر (111, 250, 345)
+    const nums = parts.map(s => parseInt(s)).filter(n => !isNaN(n));
     if (nums.length) {
         const found = [];
         nums.forEach(n => { if (contacts[n - 1]) found.push(contacts[n - 1]); });
@@ -258,7 +282,7 @@ tg.onText(/\/start/, (m) => {
 // /upload → فقط آپلود اکسل
 tg.onText(/\/upload/, (m) => {
     if (!isAdmin(m.from.id)) return;
-    tg.sendMessage(m.from.id, '📎 فایل اکسل بفرست.\n\nستون‌ها: شماره, اسم');
+    tg.sendMessage(m.from.id, '📎 فایل اکسل بفرست.\n\nستون‌ها: شماره (09...), اسم, کد اشتراک');
 });
 
 // /clear → پاک کردن اکسل از حافظه
@@ -304,7 +328,8 @@ tg.onText(/\/send/, (m) => {
     tg.sendMessage(m.from.id,
         '📝 متن پیام رو بنویس.\n\n' +
         'برای اسم: `{name}`\n' +
-        'مثال: سلام {name} عزیز، تخفیف ویژه داریم!');
+        'برای کد اشتراک: `{code}`\n' +
+        'مثال: سلام {name} عزیز، کد اشتراک شما {code} است!');
 });
 
 // /resume — restores the SAVED queue (same range), not the whole contacts list
@@ -353,7 +378,7 @@ tg.onText(/\/stop/, (m) => {
 tg.onText(/\/contacts/, (m) => {
     if (!isAdmin(m.from.id)) return;
     if (!contacts.length) return tg.sendMessage(m.from.id, 'خالیه.');
-    let l = contacts.slice(0, 20).map((c, i) => `${i + 1}. ${c.number} - ${c.name || '—'}`).join('\n');
+    let l = contacts.slice(0, 20).map((c, i) => `${i + 1}. ${dispNum(c.number)}${c.code ? ` (اشتراک: ${c.code})` : ''} - ${c.name || '—'}`).join('\n');
     if (contacts.length > 20) l += `\n... +${contacts.length - 20}`;
     tg.sendMessage(m.from.id, `📋 (${contacts.length}):\n${l}`);
 });
