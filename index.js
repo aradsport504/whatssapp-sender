@@ -30,6 +30,26 @@ let qrSent = false;
 let sendQueue = [];
 let sendResumeTimer = null;
 let convState = {};      // مکالمه مرحله‌ای
+const MY_NUMBER = process.env.MY_NUMBER || '';   // شماره واتساپ متصل‌شده (برای /pair)
+
+// ---------- ساعت تهران (Asia/Tehran) — مستقل از تایم‌زون سرور ----------
+// [TIME-HELPERS-START]
+function tehNow() { return new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Tehran' })); }
+function isAllowedTime() { const h = tehNow().getHours(); return h >= 8 && h < 23; }
+function msUntilMorning() {
+    const t = tehNow(); t.setDate(t.getDate() + 1); t.setHours(8, 0, 0, 0);
+    return Math.max(t.getTime() - tehNow().getTime(), 60000);
+}
+// [TIME-HELPERS-END]
+// [CODE-HELPERS-START]
+function codeAt(queue, idx) { const c = queue[Math.min(Math.max(idx, 0), queue.length - 1)]; return (c && c.code) || ('ردیف ' + (idx + 1)); }
+function lastDoneCode(queue, processed) {
+    for (let k = processed - 1; k >= 0; k--) { if (queue[k] && queue[k].code) return queue[k].code; }
+    return '—';
+}
+// [CODE-HELPERS-END]
+let reconnectDelay = 5000;   // backoff نمایی برای ریکانکت
+let lastDownAt = 0;
 
 const tg = new TelegramBot(TG_TOKEN, { polling: true });
 const isAdmin = (id) => ADMINS.includes(id);
@@ -56,16 +76,34 @@ async function connectWA() {
                 const buf = await QR.toBuffer(qr, { type: 'png', width: 400, margin: 2 });
                 for (const id of ADMINS) await tg.sendPhoto(id, buf, { caption: '📱 اسکن کن:\nSettings → Linked Devices → Link a Device' }).catch(() => {});
             }
-            if (connection === 'open') { waReady = true; connecting = false; qrSent = false; tell('✅ واتساپ وصل شد! 🎉'); }
+            if (connection === 'open') {
+                waReady = true; connecting = false; qrSent = false;
+                reconnectDelay = 5000;
+                if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+                if (Date.now() - lastDownAt > 60000) tell('✅ واتساپ وصل شد! 🎉');
+                lastDownAt = 0;
+            }
             if (connection === 'close') {
                 waReady = false; connecting = false;
+                if (!lastDownAt) lastDownAt = Date.now();
                 const code = lastDisconnect?.error?.output?.statusCode;
-                if (code === 401) { try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {} tell('❌ خارج شد. /qr یا /pair.'); }
-                else if (code === 405 || code === 440) tell('⚠️ بلاک شد. /qr یا /pair.');
-                else reconnectTimer = setTimeout(connectWA, 5000);
+                if (code === 401) { try { fs.rmSync(AUTH_DIR, { recursive: true }); } catch(e) {} tell('❌ از واتساپ خارج شد. /qr یا /pair.'); }
+                else if (code === 405 || code === 440) tell('⚠️ واتساپ بلاک/تعلیق شد. /qr یا /pair.');
+                else {
+                    // 515 (نیاز به ری‌استارت سشن) → فوری؛ بقیه → backoff نمایی تا سقف ۲ دقیقه (ضد حلقه قطع/وصل)
+                    const delay = (code === 515) ? 2000 : reconnectDelay;
+                    reconnectDelay = Math.min(reconnectDelay * 2, 120000);
+                    if (reconnectTimer) clearTimeout(reconnectTimer);
+                    reconnectTimer = setTimeout(connectWA, delay);
+                }
             }
         });
-    } catch (err) { connecting = false; reconnectTimer = setTimeout(connectWA, 5000); }
+    } catch (err) {
+        connecting = false;
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connectWA, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 120000);
+    }
 }
 
 function restartWA(msg) {
@@ -96,8 +134,20 @@ function dispNum(intl) {
 }
 function toJid(raw) { return normNum(raw) + '@s.whatsapp.net'; }
 function randomBetween(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-function isAllowedTime() { return new Date().getHours() >= 8 && new Date().getHours() < 23; }
-function getTomorrow8am() { const t = new Date(); t.setDate(t.getDate() + 1); t.setHours(8, 0, 0, 0); return t; }
+// ادامه خودکار فردا ۸ صبح تهران — از روی فایل پیشرفت می‌خونه، پس ری‌استارت هم خرابش نمی‌کنه
+function scheduleMorningResume(sv) {
+    if (sendResumeTimer) { clearTimeout(sendResumeTimer); sendResumeTimer = null; }
+    const waitMs = msUntilMorning();
+    sendResumeTimer = setTimeout(() => {
+        sendResumeTimer = null;
+        const cur = loadProgress();
+        if (!cur || !Array.isArray(cur.queue) || !cur.queue.length || (cur.sent || 0) >= cur.queue.length) return;
+        if (!isAllowedTime() || !waReady || !sock) { scheduleMorningResume(cur); return; }  // هنوز وقتش نیست یا وصل نیست → دوباره زمان‌بندی
+        sendQueue = cur.queue;
+        tell(`☀️ صبح بخیر! ادامه از کد ${codeAt(cur.queue, cur.sent || 0)}...`);
+        smartSend(cur.messageTemplate);
+    }, waitMs);
+}
 
 async function sendOneMessage(contact, tpl) {
     let msg = tpl.replace(/{name}/g, contact.name || '')
@@ -113,7 +163,9 @@ async function sendOneMessage(contact, tpl) {
         return { ok: true };
     } catch (e) {
         const msgErr = String(e?.message || e);
-        if (/rate|limit|429|too many|flood|blocked|banned|ban/i.test(msgErr)) return { ok: false, reason: 'limited', error: msgErr };
+        const status = e?.output?.statusCode;
+        if (status === 429 || /rate.overlimit|rate.limit|rate|limit|429|too many|flood/i.test(msgErr)) return { ok: false, reason: 'limited', error: msgErr };
+        if (/block|ban/i.test(msgErr)) return { ok: false, reason: 'blocked', error: msgErr };
         if (!waReady || !sock) return { ok: false, reason: 'down', error: msgErr };
         return { ok: false, reason: 'error', error: msgErr };
     }
@@ -124,49 +176,52 @@ async function smartSend(template) {
     if (!waReady || !sock) return tell('⚠️ واتساپ وصل نیست!');
     if (!sendQueue.length) return tell('⚠️ لیست خالیه!');
     sending = true;
+    if (sendResumeTimer) { clearTimeout(sendResumeTimer); sendResumeTimer = null; }
 
     let startIdx = 0;
     const sv0 = loadProgress();
     if (sv0 && Array.isArray(sv0.queue) && sv0.queue.length === sendQueue.length &&
         sv0.queue.every((c, j) => c.number === sendQueue[j].number)) {
         startIdx = sv0.sent || 0;
-        if (startIdx > 0) tell(`📊 ادامه از ${startIdx + 1}`);
+        if (startIdx > 0) tell(`📊 ادامه از کد ${codeAt(sendQueue, startIdx)}`);
     }
 
     let sent = 0, skippedNoWa = 0, failed = 0;
     const total = sendQueue.length;
-    tell(`🚀 شروع!\n📱 ${total} پیام\n⏰ ۸ صبح تا ۱۱ شب\n🔄 فاصله: ۹۰-۹۰۰ ثانیه رندوم`);
+    tell(`🚀 شروع!\n📱 ${total} پیام (کد ${codeAt(sendQueue, 0)} تا ${codeAt(sendQueue, total - 1)})\n⏰ ۸ صبح تا ۱۱ شب به‌وقت تهران\n🔄 فاصله: ۹۰-۹۰۰ ثانیه رندوم`);
 
     for (let i = startIdx; i < sendQueue.length; i++) {
         if (!sending) { tell('🛑 متوقف شد.'); break; }
         if (!isAllowedTime()) {
             sending = false;
-            const waitMs = getTomorrow8am() - new Date();
-            tell(`⏸️ ۱۱ شب شد!\n📅 فردا ۸ صبح ادامه\n📊 ✅${sent} ⏭️${skippedNoWa} ❌${failed} | باقی: ${sendQueue.length - i}`);
             saveProgress(sendQueue, i, template);
-            sendResumeTimer = setTimeout(() => { tell('☀️ صبح بخیر! ادامه...'); sendQueue = sendQueue.slice(i); smartSend(template); }, waitMs);
+            tell(`⏸️ ۱۱ شب شد!\n📅 فردا ۸ صبح تهران خودکار ادامه میدم\n📊 تا کد ${lastDoneCode(sendQueue, i)} ✅${sent} ⏭️${skippedNoWa} ❌${failed} | باقی: ${sendQueue.length - i}`);
+            scheduleMorningResume({ queue: sendQueue, sent: i, messageTemplate: template });
             return;
         }
         const result = await sendOneMessage(sendQueue[i], template);
         if (result.ok) sent++;
         else if (result.reason === 'no-wa') skippedNoWa++;   // واتساپ نداره → رد شو، ادامه بده
-        else if (result.reason === 'limited' || result.reason === 'down') {
-            // لیمیت واتساپ یا قطع اتصال → وایسا، پیشرفت ذخیره‌ست، با /resume ادامه بده
+        else if (result.reason === 'limited' || result.reason === 'down' || result.reason === 'blocked') {
+            // لیمیت/بلاک واتساپ یا قطع اتصال → وایسا، پیشرفت ذخیره‌ست، با /resume ادامه بده
             sending = false;
             saveProgress(sendQueue, i, template);
-            tell(`⛔ ${result.reason === 'limited' ? 'واتساپ لیمیت داد! فعلاً وایسادم.' : 'اتصال واتساپ قطع شد!'}\n📊 ✅${sent} ⏭️${skippedNoWa} ❌${failed} | باقی: ${sendQueue.length - i}\n🔄 بعداً با /resume ادامه بده.`);
+            const why = result.reason === 'limited' ? '🚫 واتساپ لیمیت خورد! (محدودیت ارسال)' : result.reason === 'blocked' ? '🚫 واتساپ بلاک کرد!' : 'اتصال واتساپ قطع شد!';
+            const advice = result.reason === 'down' ? 'وقتی وصل شد با /resume ادامه بده.' : 'چند ساعت صبر کن، بعد با /resume ادامه بده.';
+            tell(`⛔ ${why}\n📊 تا کد ${lastDoneCode(sendQueue, i)} ✅${sent} ⏭️${skippedNoWa} ❌${failed} | باقی: ${sendQueue.length - i}\n🔄 ${advice}`);
             return;
         }
         else failed++;
         const done = sent + skippedNoWa + failed;
-        if (done % 10 === 0) tell(`📊 ${done}/${total} ✅${sent} ⏭️${skippedNoWa} ❌${failed}`);
+        if (done % 10 === 0) tell(`📊 تا کد ${lastDoneCode(sendQueue, i + 1)} (${done}/${total}) ✅${sent} ⏭️${skippedNoWa} ❌${failed}`);
         saveProgress(sendQueue, i + 1, template);
         if (i < sendQueue.length - 1) await new Promise(r => setTimeout(r, randomBetween(90, 900) * 1000));
     }
 
+    const finalCode = sendQueue.length ? lastDoneCode(sendQueue, sendQueue.length) : '—';
     sending = false; sendQueue = [];
     try { fs.unlinkSync('./send_progress.json'); } catch(e) {}
-    tell(`✅ تمام شد!\n📊 ✅${sent} ⏭️${skippedNoWa} (بدون واتساپ) ❌${failed} از ${total}`);
+    tell(`✅ تمام شد!\n📊 تا کد ${finalCode} ✅${sent} ⏭️${skippedNoWa} (بدون واتساپ) ❌${failed} از ${total}`);
 }
 
 function saveProgress(queue, sent, template) {
@@ -247,7 +302,7 @@ tg.on('document', async (m) => {
             return tg.sendMessage(m.from.id,
                 `❌ ۰ شماره ذخیره شد!\n\n🔍 ستون‌های پیدا شده:\n${headers}\n\n📄 سطر اول:\n${firstRow}\n\nاسم دقیق ستون شماره رو بفرست تا اضافه‌ش کنم.`);
         }
-        const sample = contacts.slice(0, 5).map((c, i) => `${i + 1}. ${dispNum(c.number)}${c.code ? ` (اشتراک: ${c.code})` : ''} - ${c.name || '—'}`).join('\n');
+        const sample = contacts.slice(0, 5).map((c) => `• کد اشتراک: ${c.code || '—'}`).join('\n');
         tg.sendMessage(m.from.id,
             `✅ ${contacts.length} شماره ذخیره شد!${skipped ? `\n⚠️ ${skipped} سطر شماره نامعتبر داشت و رد شد.` : ''}\n\n${sample}${contacts.length > 5 ? `\n... +${contacts.length - 5}` : ''}\n\n/upload مجدد برای آپلود جدید`);
     } catch (e) { tg.sendMessage(m.from.id, `❌ ${e.message}`); }
@@ -273,9 +328,9 @@ tg.on('message', (m) => {
         sendQueue = parseRange(text);
         if (!sendQueue.length) return tg.sendMessage(m.from.id, '❌ هیچ کد اشتراکی پیدا نشد. فقط کد اشتراک بفرست.');
         const preview = st.template.replace(/{name}/g, 'نام‌مشتری');
-        const sample = sendQueue.slice(0, 3).map((c, i) => `${i + 1}. ${dispNum(c.number)}${c.code ? ` (اشتراک: ${c.code})` : ''} - ${c.name || '—'}`).join('\n');
+        const sample = sendQueue.slice(0, 3).map((c) => `• کد اشتراک: ${c.code || '—'}`).join('\n');
         tg.sendMessage(m.from.id,
-            `📋 پیش‌نمایش:\n📝 ${preview}\n\n👥 ${sendQueue.length} نفر:\n${sample}${sendQueue.length > 3 ? `\n... +${sendQueue.length - 3}` : ''}\n\n✅ تأیید؟ (بله/خیر)`);
+            `📋 پیش‌نمایش:\n📝 ${preview}\n\n👥 ${sendQueue.length} نفر (کد ${codeAt(sendQueue, 0)} تا ${codeAt(sendQueue, sendQueue.length - 1)}):\n${sample}${sendQueue.length > 3 ? `\n...` : ''}\n\n✅ تأیید؟ (بله/خیر)`);
         st.pendingTemplate = st.template;
         st.pendingQueue = [...sendQueue];
         convState[m.from.id] = { step: 'confirm', pendingTemplate: st.pendingTemplate, pendingQueue: st.pendingQueue };
@@ -422,13 +477,20 @@ tg.onText(/\/send/, (m) => {
         'مثال: سلام {name} عزیز، تخفیف ویژه داریم!');
 });
 
-// /resume — restores the SAVED queue (same range), not the whole contacts list
+// /resume — از روی فایل ذخیره‌شده ادامه میده (نه کل لیست)؛ ساعت مجاز و اتصال رو چک می‌کنه
 tg.onText(/\/resume/, (m) => {
     if (!isAdmin(m.from.id)) return;
+    if (sending) return tg.sendMessage(m.from.id, '⚠️ در حال ارساله!');
+    if (sendResumeTimer) { clearTimeout(sendResumeTimer); sendResumeTimer = null; }  // تایمر قدیمی پاک تا دوبار ارسال نشه
     const sv = loadProgress();
-    if (!sv || !Array.isArray(sv.queue) || !sv.queue.length) return tg.sendMessage(m.from.id, '❌ ارسال قبلی نیست.');
+    if (!sv || !Array.isArray(sv.queue) || !sv.queue.length || (sv.sent || 0) >= sv.queue.length) return tg.sendMessage(m.from.id, '❌ ارسال ناقصی نیست.');
+    if (!waReady || !sock) return tg.sendMessage(m.from.id, '⚠️ واتساپ وصل نیست! اول وصل شو بعد /resume بزن.');
     sendQueue = sv.queue;
-    tell(`🔄 ادامه از ${sv.sent + 1}...`);
+    if (!isAllowedTime()) {
+        scheduleMorningResume(sv);
+        return tg.sendMessage(m.from.id, `⏸️ الان ساعت مجاز نیست! فردا ۸ صبح تهران خودکار از کد ${codeAt(sv.queue, sv.sent || 0)} ادامه میدم.`);
+    }
+    tell(`🔄 ادامه از کد ${codeAt(sv.queue, sv.sent || 0)}...`);
     smartSend(sv.messageTemplate);
 });
 
@@ -453,7 +515,7 @@ tg.onText(/\/status/, (m) => {
     if (sending) s += `\n🔄 در حال ارسال...`;
     const sv = loadProgress();
     if (sv && sv.queue) {
-        s += `\n⏸️ ناقص: از ${sv.sent + 1} (از ${sv.queue.length} نفر)`;
+        s += `\n⏸️ ناقص: تا کد ${lastDoneCode(sv.queue, sv.sent || 0)} رفته (از کد ${codeAt(sv.queue, 0)} تا ${codeAt(sv.queue, sv.queue.length - 1)})`;
     }
     tg.sendMessage(m.from.id, s);
 });
@@ -494,8 +556,23 @@ tg.onText(/\/addaccess (.+)/, (m, match) => {
 
 tg.onText(/\/limit/, (m) => {
     if (!isAdmin(m.from.id)) return;
-    tg.sendMessage(m.from.id, '⏰ ۸ صبح - ۱۱ شب\n🔄 ۹۰-۹۰۰ ثانیه رندوم\n📅 ناقص → فردا ۸ صبح');
+    tg.sendMessage(m.from.id, '⏰ ۸ صبح - ۱۱ شب (به‌وقت تهران)\n🔄 ۹۰-۹۰۰ ثانیه رندوم\n📅 ناقص → فردا ۸ صبح خودکار');
 });
+
+// نگهبان اتصال: اگه سوکت بی‌صدا مرد و تایمر ریکانکتی هم نیست، وصل شو (جلوگیری از قطع‌موندن)
+setInterval(() => { if (!waReady && !connecting && !reconnectTimer) connectWA(); }, 60000);
+
+// برگشت بعد از ری‌استارت: اگه ارسال ناقص مونده، خبر بده و اگه شبه، صبح خودکار ادامه بده
+(function bootRecover() {
+    const sv = loadProgress();
+    if (!sv || !Array.isArray(sv.queue) || !sv.queue.length || (sv.sent || 0) >= sv.queue.length) return;
+    if (!isAllowedTime()) {
+        scheduleMorningResume(sv);
+        tell(`⏸️ ارسال ناقصه (تا کد ${lastDoneCode(sv.queue, sv.sent || 0)}). فردا ۸ صبح تهران خودکار ادامه میدم.`);
+    } else {
+        tell(`📊 ارسال ناقص مونده (تا کد ${lastDoneCode(sv.queue, sv.sent || 0)}). با /resume ادامه بده.`);
+    }
+})();
 
 // ============ START ============
 console.log('🚀 Starting...');
